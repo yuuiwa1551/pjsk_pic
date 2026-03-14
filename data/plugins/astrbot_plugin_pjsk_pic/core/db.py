@@ -9,6 +9,7 @@ from typing import Any, Iterable
 
 from .matcher import normalize_tag_name
 from .models import APPROVED_STATUSES, MatchResult
+from .phash import hamming_distance
 
 
 def utcnow_str() -> str:
@@ -154,6 +155,7 @@ class ImageIndexDB:
             self._ensure_column(conn, 'image_tags', 'review_status', "TEXT DEFAULT 'approved'")
             self._ensure_column(conn, 'image_tags', 'review_reason', "TEXT DEFAULT ''")
             self._ensure_column(conn, 'image_tags', 'updated_at', "TEXT DEFAULT ''")
+            self._ensure_column(conn, 'crawl_jobs', 'attempt_count', 'INTEGER DEFAULT 0')
 
     def upsert_image(self, *, file_path: str, file_name: str, sha256: str, width: int, height: int, format_: str, phash: str = '') -> int:
         now = utcnow_str()
@@ -190,6 +192,27 @@ class ImageIndexDB:
                 (file_path, file_name, sha256, phash, width, height, format_, now, now),
             )
             return int(cursor.lastrowid)
+
+    def find_similar_images_by_phash(self, phash: str, *, max_distance: int = 8, limit: int = 10) -> list[sqlite3.Row]:
+        if not phash:
+            return []
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, file_path, phash
+                FROM images
+                WHERE is_active = 1 AND phash != ''
+                ORDER BY id DESC
+                LIMIT 500
+                """
+            ).fetchall()
+        matches: list[tuple[int, sqlite3.Row]] = []
+        for row in rows:
+            distance = hamming_distance(phash, str(row["phash"] or ""))
+            if distance <= max_distance:
+                matches.append((distance, row))
+        matches.sort(key=lambda item: (item[0], -int(item[1]["id"])))
+        return [row for _, row in matches[:limit]]
 
     def mark_missing_files_inactive(self, library_root: str, seen_paths: set[str]) -> int:
         root = str(Path(library_root).resolve())
@@ -440,8 +463,8 @@ class ImageIndexDB:
         with self._lock, self._connect() as conn:
             cursor = conn.execute(
                 """
-                INSERT INTO crawl_jobs(platform, source_url, tags_text, status, progress, error_log, result_summary, created_at, updated_at)
-                VALUES(?, ?, ?, 'pending', 0, '', '', ?, ?)
+                INSERT INTO crawl_jobs(platform, source_url, tags_text, status, progress, error_log, result_summary, attempt_count, created_at, updated_at)
+                VALUES(?, ?, ?, 'pending', 0, '', '', 0, ?, ?)
                 """,
                 (platform, source_url, ','.join(tags), now, now),
             )
@@ -451,7 +474,7 @@ class ImageIndexDB:
         with self._lock, self._connect() as conn:
             return conn.execute('SELECT * FROM crawl_jobs WHERE id = ?', (job_id,)).fetchone()
 
-    def update_crawl_job(self, job_id: int, *, status: str | None = None, progress: int | None = None, error_log: str | None = None, result_summary: str | None = None) -> None:
+    def update_crawl_job(self, job_id: int, *, status: str | None = None, progress: int | None = None, error_log: str | None = None, result_summary: str | None = None, attempt_count: int | None = None) -> None:
         fields: list[str] = ['updated_at = ?']
         params: list[Any] = [utcnow_str()]
         if status is not None:
@@ -466,9 +489,20 @@ class ImageIndexDB:
         if result_summary is not None:
             fields.append('result_summary = ?')
             params.append(result_summary)
+        if attempt_count is not None:
+            fields.append('attempt_count = ?')
+            params.append(attempt_count)
         params.append(job_id)
         with self._lock, self._connect() as conn:
             conn.execute(f"UPDATE crawl_jobs SET {', '.join(fields)} WHERE id = ?", params)
+
+    def increment_crawl_job_attempt(self, job_id: int) -> int:
+        with self._lock, self._connect() as conn:
+            row = conn.execute('SELECT attempt_count FROM crawl_jobs WHERE id = ?', (job_id,)).fetchone()
+            current = int(row['attempt_count'] or 0) if row else 0
+            current += 1
+            conn.execute('UPDATE crawl_jobs SET attempt_count = ?, updated_at = ? WHERE id = ?', (current, utcnow_str(), job_id))
+            return current
 
     def list_crawl_jobs(self, *, limit: int = 20, statuses: Iterable[str] | None = None) -> list[sqlite3.Row]:
         sql = 'SELECT * FROM crawl_jobs'
@@ -518,10 +552,12 @@ class ImageIndexDB:
             SELECT rt.id, rt.status, rt.reason, rt.model_result, rt.manual_result,
                    rt.created_at, rt.updated_at,
                    i.id AS image_id, i.file_path,
-                   t.id AS tag_id, t.name AS tag_name
+                   t.id AS tag_id, t.name AS tag_name,
+                   it.source_type AS source_type
             FROM review_tasks rt
             JOIN images i ON i.id = rt.image_id
             JOIN tags t ON t.id = rt.tag_id
+            LEFT JOIN image_tags it ON it.image_id = rt.image_id AND it.tag_id = rt.tag_id
         """
         params: list[Any] = []
         if status:
@@ -538,10 +574,12 @@ class ImageIndexDB:
                 """
                 SELECT rt.id, rt.status, rt.reason, rt.model_result, rt.manual_result,
                        i.id AS image_id, i.file_path,
-                       t.id AS tag_id, t.name AS tag_name
+                       t.id AS tag_id, t.name AS tag_name,
+                       it.source_type AS source_type
                 FROM review_tasks rt
                 JOIN images i ON i.id = rt.image_id
                 JOIN tags t ON t.id = rt.tag_id
+                LEFT JOIN image_tags it ON it.image_id = rt.image_id AND it.tag_id = rt.tag_id
                 WHERE rt.id = ?
                 """,
                 (review_id,),
@@ -568,7 +606,7 @@ class ImageIndexDB:
 
     def search_images(self, *, keyword: str = '', review_status: str = '', tag_name: str = '', platform: str = '', limit: int = 100, offset: int = 0) -> list[sqlite3.Row]:
         sql = """
-            SELECT DISTINCT i.id, i.file_path, i.file_name, i.width, i.height, i.format, i.updated_at
+            SELECT DISTINCT i.id, i.file_path, i.file_name, i.width, i.height, i.format, i.phash, i.updated_at
             FROM images i
             LEFT JOIN image_tags it ON it.image_id = i.id
             LEFT JOIN tags t ON t.id = it.tag_id
@@ -579,8 +617,8 @@ class ImageIndexDB:
         params: list[Any] = []
         if keyword:
             normalized = normalize_tag_name(keyword)
-            sql += " AND (i.file_name LIKE ? OR t.normalized_name LIKE ? OR a.normalized_alias LIKE ?)"
-            params.extend([f'%{keyword}%', f'%{normalized}%', f'%{normalized}%'])
+            sql += " AND (i.file_name LIKE ? OR t.normalized_name LIKE ? OR a.normalized_alias LIKE ? OR s.post_url LIKE ? OR s.author LIKE ?)"
+            params.extend([f'%{keyword}%', f'%{normalized}%', f'%{normalized}%', f'%{keyword}%', f'%{keyword}%'])
         if review_status:
             sql += ' AND it.review_status = ?'
             params.append(review_status)

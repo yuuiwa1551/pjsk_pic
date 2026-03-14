@@ -5,12 +5,15 @@ from .importer import ImportedImageService
 from .indexer import LibraryIndexer
 from .matcher import extract_query_from_text, normalize_tag_name
 from .models import CrawlCandidate, ImportedImage, MatchResult, ReviewDecision
+from .phash import compute_image_phash, hamming_distance
 from .review_service import ReviewService
+from .tag_cleaner import TagCleaner
 
 __all__ = [
     "CrawlAdapterFactory",
     "CrawlCandidate",
     "CrawlService",
+    "TagCleaner",
     "ImageIndexDB",
     "ImportedImage",
     "ImportedImageService",
@@ -18,6 +21,8 @@ __all__ = [
     "MatchResult",
     "ReviewDecision",
     "ReviewService",
+    "compute_image_phash",
     "extract_query_from_text",
+    "hamming_distance",
     "normalize_tag_name",
 ]

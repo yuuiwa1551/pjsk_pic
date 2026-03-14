@@ -36,7 +36,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <body>
 <header>
   <h1 style="margin:0;">PJSK 图片库管理台</h1>
-  <div class="muted" style="color:#dce4ff;">支持图库检索、tag/别名管理、审核任务与采集任务查看</div>
+  <div class="muted" style="color:#dce4ff;">支持图库检索、tag/别名管理、审核任务、采集任务与平台来源信息查看</div>
 </header>
 <main>
   <div>
@@ -50,7 +50,7 @@ HTML_PAGE = """<!DOCTYPE html>
         <input id="keyword" placeholder="关键词 / tag / alias" style="flex:1;" />
         <input id="tag" placeholder="精确 tag" />
         <select id="status"><option value="">全部状态</option><option>approved</option><option>manual_approved</option><option>pending</option><option>uncertain</option><option>rejected</option><option>manual_rejected</option></select>
-        <select id="platform"><option value="">全部平台</option><option>pixiv</option><option>x</option><option>xiaohongshu</option><option>lofter</option><option>generic</option></select>
+        <select id="platform"><option value="">全部平台</option><option>pixiv</option><option>x</option><option>xiaohongshu</option><option>generic</option></select>
         <button onclick="loadImages()">搜索</button>
       </div>
       <div class="grid" id="images"></div>
@@ -60,7 +60,7 @@ HTML_PAGE = """<!DOCTYPE html>
     <section>
       <h2>采集任务</h2>
       <div class="row">
-        <select id="jobPlatform"><option>pixiv</option><option>x</option><option>xiaohongshu</option><option>lofter</option><option>generic</option></select>
+        <select id="jobPlatform"><option>pixiv</option><option>x</option><option>xiaohongshu</option><option>generic</option></select>
         <input id="jobUrl" placeholder="帖子链接或图片直链" style="flex:1;" />
       </div>
       <div class="row">
@@ -125,7 +125,10 @@ async function loadImages() {
       <img src="${api(`/api/image-file?image_id=${item.id}`)}" loading="lazy" />
       <div class="body">
         <div><strong>#${item.id}</strong> ${item.file_name}</div>
-        <div class="muted">${item.width}x${item.height} · ${item.format}</div>
+        <div class="muted">${item.width}x${item.height} · ${item.format} · ${item.platform || 'local'}</div>
+        <div class="muted">phash: ${item.phash || '-'}</div>
+        <div class="muted">来源: ${item.post_url || '-'}</div>
+        <div class="muted">疑似重复: ${(item.similar_image_ids || []).join(', ') || '无'}</div>
         <div>${(item.tags || []).map(t => `<span class="pill">${t.name}(${t.review_status})</span>`).join('')}</div>
       </div>
     </div>
@@ -135,7 +138,7 @@ async function loadJobs() {
   const data = await fetchJson('/api/jobs');
   document.getElementById('jobs').innerHTML = (data.items || []).map(item => `
     <div class="item">
-      <div><strong>#${item.id}</strong> [${item.status}] ${item.platform}</div>
+      <div><strong>#${item.id}</strong> [${item.status}] ${item.platform} · 第${item.attempt_count || 0}次</div>
       <div class="muted">${item.source_url}</div>
       <div>标签：${item.tags_text || '自动提取'}</div>
       <div>结果：${item.result_summary || item.error_log || '-'}</div>
@@ -161,7 +164,7 @@ async function loadReviews() {
   document.getElementById('reviews').innerHTML = (data.items || []).map(item => `
     <div class="item">
       <div><strong>#${item.id}</strong> [${item.status}] ${item.tag_name}</div>
-      <div class="muted">image=${item.image_id}</div>
+      <div class="muted">image=${item.image_id} · source=${item.source_type || '-'}</div>
       <div>${item.reason || '-'}</div>
       <div class="row">
         <button onclick="reviewDecision(${item.id}, true)">通过</button>
@@ -243,6 +246,8 @@ class GalleryWebUI:
         items = []
         for row in rows:
             detail = self.db.get_image_detail(int(row["id"])) or {}
+            sources = detail.get("sources", [])
+            source0 = sources[0] if sources else {}
             items.append(
                 {
                     "id": int(row["id"]),
@@ -251,8 +256,12 @@ class GalleryWebUI:
                     "height": int(row["height"] or 0),
                     "format": str(row["format"] or ""),
                     "updated_at": str(row["updated_at"] or ""),
+                    "phash": str(row["phash"] or ""),
                     "tags": detail.get("tags", []),
-                    "sources": detail.get("sources", []),
+                    "sources": sources,
+                    "platform": source0.get("platform", ""),
+                    "post_url": source0.get("post_url", ""),
+                    "similar_image_ids": source0.get("extra", {}).get("similar_image_ids", []),
                 }
             )
         return jsonify({"items": items})

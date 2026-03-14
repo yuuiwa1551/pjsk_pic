@@ -23,6 +23,8 @@ class CrawlCandidate:
     platform: str
     post_url: str
     image_url: str
+    normalized_post_url: str = ""
+    source_uid: str = ""
     raw_tags: list[str] = field(default_factory=list)
     author: str = ""
     title: str = ""
@@ -34,9 +36,11 @@ class ImportedImage:
     image_id: int
     file_path: Path
     sha256: str
+    phash: str
     width: int
     height: int
     format: str
+    similar_image_ids: list[int] = field(default_factory=list)
 
 
 @dataclass

@@ -13,6 +13,7 @@ from PIL import Image
 
 from .db import ImageIndexDB
 from .models import CrawlCandidate, ImportedImage
+from .phash import compute_image_phash
 
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -34,12 +35,22 @@ FORMAT_EXTENSIONS = {
 
 
 class ImportedImageService:
-    def __init__(self, db: ImageIndexDB, data_dir: Path, *, timeout_seconds: int = 20) -> None:
+    def __init__(
+        self,
+        db: ImageIndexDB,
+        data_dir: Path,
+        *,
+        timeout_seconds: int = 20,
+        enable_phash_dedupe: bool = True,
+        phash_max_distance: int = 8,
+    ) -> None:
         self.db = db
         self.data_dir = data_dir
         self.import_root = (data_dir / "images" / "imported").resolve()
         self.import_root.mkdir(parents=True, exist_ok=True)
         self.timeout_seconds = timeout_seconds
+        self.enable_phash_dedupe = enable_phash_dedupe
+        self.phash_max_distance = phash_max_distance
 
     async def import_candidate(self, candidate: CrawlCandidate) -> ImportedImage:
         return await asyncio.to_thread(self._import_candidate_sync, candidate)
@@ -56,6 +67,8 @@ class ImportedImageService:
 
         sha256 = hashlib.sha256(body).hexdigest()
         width, height, format_name = self._read_image_meta(body)
+        phash = compute_image_phash(body) if self.enable_phash_dedupe else ""
+        similar_rows = self.db.find_similar_images_by_phash(phash, max_distance=self.phash_max_distance) if phash else []
         extension = self._guess_extension(final_url, content_type, format_name)
         file_dir = self.import_root / candidate.platform / sha256[:2]
         file_dir.mkdir(parents=True, exist_ok=True)
@@ -67,6 +80,7 @@ class ImportedImageService:
             file_path=str(file_path),
             file_name=file_path.name,
             sha256=sha256,
+            phash=phash,
             width=width,
             height=height,
             format_=format_name,
@@ -75,9 +89,11 @@ class ImportedImageService:
             image_id=image_id,
             file_path=file_path,
             sha256=sha256,
+            phash=phash,
             width=width,
             height=height,
             format=format_name,
+            similar_image_ids=[int(row["id"]) for row in similar_rows if int(row["id"]) != image_id],
         )
 
     @staticmethod

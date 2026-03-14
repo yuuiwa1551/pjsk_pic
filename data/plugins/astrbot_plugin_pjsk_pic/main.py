@@ -28,7 +28,13 @@ class PJSKPicPlugin(Star):
         self.data_dir = StarTools.get_data_dir("astrbot_plugin_pjsk_pic")
         self.db = ImageIndexDB(self.data_dir / "image_index.db")
         self.indexer = LibraryIndexer(self.db)
-        self.importer = ImportedImageService(self.db, self.data_dir, timeout_seconds=self._crawler_timeout())
+        self.importer = ImportedImageService(
+            self.db,
+            self.data_dir,
+            timeout_seconds=self._crawler_timeout(),
+            enable_phash_dedupe=bool(self.config.get("enable_phash_dedupe", True)),
+            phash_max_distance=int(self.config.get("phash_max_distance", 8) or 8),
+        )
         self.reviewer = ReviewService(context, self.db, config)
         self.crawl_service = CrawlService(
             db=self.db,
@@ -69,7 +75,7 @@ class PJSKPicPlugin(Star):
         return max(1, count)
 
     def _crawler_timeout(self) -> int:
-        value = int(self.config.get("crawler_timeout_seconds", 20) or 20)
+        value = int(self.config.get("platform_request_timeout", self.config.get("crawler_timeout_seconds", 20)) or 20)
         return max(5, value)
 
     def _recent_queue(self, session_id: str) -> deque[int]:

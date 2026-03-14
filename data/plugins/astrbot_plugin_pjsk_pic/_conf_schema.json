@@ -44,10 +44,35 @@
     "description": "采集下载超时时间（秒）。",
     "default": 20
   },
+  "platform_request_timeout": {
+    "type": "int",
+    "description": "平台采集请求超时时间（秒），优先于 crawler_timeout_seconds。",
+    "default": 20
+  },
+  "platform_retry_times": {
+    "type": "int",
+    "description": "平台采集失败后的自动重试次数。",
+    "default": 2
+  },
   "max_tags_per_image": {
     "type": "int",
     "description": "每张图最多写入多少个 tag。",
     "default": 12
+  },
+  "tag_blacklist": {
+    "type": "string",
+    "description": "额外 tag 黑名单，多个用英文逗号分隔。",
+    "default": ""
+  },
+  "enable_phash_dedupe": {
+    "type": "bool",
+    "description": "是否启用轻量感知哈希去重识别。",
+    "default": true
+  },
+  "phash_max_distance": {
+    "type": "int",
+    "description": "判定为疑似重复图的最大哈希距离。",
+    "default": 8
   },
   "enable_auto_review": {
     "type": "bool",
@@ -73,5 +98,25 @@
     "type": "bool",
     "description": "是否启用启发式角色 tag 判断。",
     "default": true
+  },
+  "pixiv_refresh_token": {
+    "type": "string",
+    "description": "Pixiv 登录增强预留字段，当前主要用于后续扩展。",
+    "default": ""
+  },
+  "x_cookie_string": {
+    "type": "string",
+    "description": "X/Twitter 请求使用的 Cookie 串，提升私有/受限页面可访问性。",
+    "default": ""
+  },
+  "x_account_pool_enabled": {
+    "type": "bool",
+    "description": "X 账号池预留开关，当前版本仅预留配置位。",
+    "default": false
+  },
+  "xiaohongshu_cookie_string": {
+    "type": "string",
+    "description": "小红书请求使用的 Cookie 串，提升页面解析成功率。",
+    "default": ""
   }
 }

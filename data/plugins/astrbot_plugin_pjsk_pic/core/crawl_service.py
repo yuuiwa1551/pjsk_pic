@@ -9,6 +9,7 @@ from .crawl_adapter import CrawlAdapterFactory
 from .db import ImageIndexDB
 from .importer import ImportedImageService
 from .review_service import ReviewService
+from .tag_cleaner import TagCleaner
 
 
 class CrawlService:
@@ -17,6 +18,7 @@ class CrawlService:
         self.importer = importer
         self.reviewer = reviewer
         self.config = config
+        self.tag_cleaner = TagCleaner(config)
         self._queue: asyncio.Queue[int] = asyncio.Queue()
         self._queued_ids: set[int] = set()
         self._worker_task: asyncio.Task | None = None
@@ -85,21 +87,31 @@ class CrawlService:
         if not row:
             return
 
+        attempt_count = self.db.increment_crawl_job_attempt(job_id)
         platform = str(row["platform"])
         source_url = str(row["source_url"])
         manual_tags = self._parse_tags_text(str(row["tags_text"] or ""))
-        adapter = CrawlAdapterFactory.create(platform)
+        adapter = CrawlAdapterFactory.create(platform, config=self.config)
         max_candidates = max(1, int(self.config.get("crawler_max_candidates", 6) or 6))
-        timeout_seconds = max(5, int(self.config.get("crawler_timeout_seconds", 20) or 20))
+        timeout_seconds = max(5, int(self.config.get("platform_request_timeout", self.config.get("crawler_timeout_seconds", 20)) or 20))
+        retry_times = max(1, int(self.config.get("platform_retry_times", 2) or 2))
 
-        self.db.update_crawl_job(job_id, status="running", progress=5, error_log="", result_summary="")
-        candidates = await adapter.fetch_candidates(
-            source_url,
-            max_candidates=max_candidates,
-            timeout_seconds=timeout_seconds,
-        )
+        self.db.update_crawl_job(job_id, status="running", progress=5, error_log="", result_summary="", attempt_count=attempt_count)
+        candidates: list = []
+        last_error = ""
+        for _ in range(retry_times):
+            try:
+                candidates = await adapter.fetch_candidates(
+                    source_url,
+                    max_candidates=max_candidates,
+                    timeout_seconds=timeout_seconds,
+                )
+                if candidates:
+                    break
+            except Exception as exc:
+                last_error = str(exc)
         if not candidates:
-            self.db.update_crawl_job(job_id, status="failed", progress=0, error_log="未解析到可下载图片")
+            self.db.update_crawl_job(job_id, status="failed", progress=0, error_log=last_error or "未解析到可下载图片")
             return
 
         imported_count = 0
@@ -108,6 +120,7 @@ class CrawlService:
         approved_links = 0
         rejected_links = 0
         skipped_without_tags = 0
+        similar_hits = 0
 
         for index, candidate in enumerate(candidates, start=1):
             progress = 10 + int(index / max(1, len(candidates)) * 80)
@@ -115,17 +128,24 @@ class CrawlService:
 
             imported = await self.importer.import_candidate(candidate)
             imported_count += 1
+            if imported.similar_image_ids:
+                similar_hits += 1
             self.db.upsert_source(
                 image_id=imported.image_id,
                 platform=platform,
-                post_url=candidate.post_url,
+                post_url=candidate.normalized_post_url or candidate.post_url,
                 image_url=candidate.image_url,
                 author=candidate.author,
                 raw_tags=candidate.raw_tags,
-                extra_json={"title": candidate.title, **(candidate.extra or {})},
+                extra_json={
+                    "title": candidate.title,
+                    "source_uid": candidate.source_uid,
+                    "similar_image_ids": imported.similar_image_ids,
+                    **(candidate.extra or {}),
+                },
             )
 
-            tags = self._merge_tags(manual_tags, candidate.raw_tags)
+            tags = self.tag_cleaner.clean_tags(self._merge_tags(manual_tags, candidate.raw_tags), platform=platform)
             if not tags:
                 skipped_without_tags += 1
                 continue
@@ -170,6 +190,8 @@ class CrawlService:
         )
         if skipped_without_tags:
             summary += f"，无 tag 图片 {skipped_without_tags}"
+        if similar_hits:
+            summary += f"，疑似重复 {similar_hits}"
         self.db.update_crawl_job(job_id, status="completed", progress=100, result_summary=summary)
 
     @staticmethod
