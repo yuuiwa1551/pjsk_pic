@@ -6,7 +6,7 @@
   },
   "scan_on_startup": {
     "type": "bool",
-    "description": "AstrBot 启动后是否自动扫描图库。",
+    "description": "AstrBot 启动后是否自动扫描本地图库。",
     "default": true
   },
   "allow_fuzzy_match": {
@@ -33,5 +33,45 @@
     "type": "int",
     "description": "LLM 工具默认发图数量。当前建议为 1。",
     "default": 1
+  },
+  "crawler_max_candidates": {
+    "type": "int",
+    "description": "采集页面最多解析并下载几张图。",
+    "default": 6
+  },
+  "crawler_timeout_seconds": {
+    "type": "int",
+    "description": "采集下载超时时间（秒）。",
+    "default": 20
+  },
+  "max_tags_per_image": {
+    "type": "int",
+    "description": "每张图最多写入多少个 tag。",
+    "default": 12
+  },
+  "enable_auto_review": {
+    "type": "bool",
+    "description": "是否启用多模态模型自动审核角色 tag。",
+    "default": false
+  },
+  "review_provider_id": {
+    "type": "string",
+    "description": "执行多模态审核使用的 provider id。留空则自动审核不会运行。",
+    "default": ""
+  },
+  "review_confidence_threshold": {
+    "type": "float",
+    "description": "自动审核通过/拒绝所需的最低置信度。",
+    "default": 0.78
+  },
+  "approve_non_character_tags": {
+    "type": "bool",
+    "description": "非角色 tag 是否默认直接通过。",
+    "default": true
+  },
+  "guess_character_tags": {
+    "type": "bool",
+    "description": "是否启用启发式角色 tag 判断。",
+    "default": true
   }
 }
