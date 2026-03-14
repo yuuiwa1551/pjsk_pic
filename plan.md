@@ -1,0 +1,247 @@
+# 图片图库插件开发总计划
+
+## 完成情况
+
+### 已完成
+
+- [x] 第一期 MVP 已实现
+  - [x] 新建 `astrbot_plugin_pjsk_pic` 插件骨架
+  - [x] SQLite 图片索引
+  - [x] 本地图库扫描入库
+  - [x] 按 tag / alias 随机发图
+  - [x] 自然语言规则触发（如“看看xxx”“来张xxx”）
+  - [x] LLM Tool 触发
+  - [x] 基础管理命令：重扫、统计、查看 tag、别名增删查
+  - [x] 基础去重与发送日志
+
+### 进行中
+
+- [ ] 第二期：采集 + 自动审核
+
+### 未开始
+
+- [ ] 第三期：WebUI 管理
+
+## 目标
+构建一个 AstrBot 图片图库插件，支持：
+
+1. 用户通过自然语言请求发图
+2. 从本地图库按 tag/别名随机发送图片
+3. 后续支持多平台采集、自动审核、自动打标
+4. 提供 WebUI 管理图库、tag、别名、审核状态和采集任务
+
+---
+
+## 总体分期
+
+### 第一期：发图 MVP
+目标：先让 bot 能稳定地“按 tag 发本地图”。
+
+功能范围：
+
+1. 自然语言触发
+   - 规则触发，如“看看xxx”“来张xxx”“发一张xxx”
+   - LLM Tool 兜底触发
+2. 本地图库索引
+   - 扫描本地图片目录
+   - 记录图片与 tag 的关系
+   - 支持 tag 别名
+3. 发图逻辑
+   - 按 tag 或别名查图
+   - 随机发一张
+   - 支持简单去重/避免短时间重复
+4. 基础管理
+   - 重扫图库
+   - 查询 tag 数量
+   - 查询某 tag 的图片数
+
+不做：
+
+- 爬虫采集
+- 自动审核
+- WebUI
+
+---
+
+### 第二期：采集 + 自动审核
+目标：把“找图、下载、审核、入库”串起来。
+
+功能范围：
+
+1. 爬虫适配层
+   - pixiv
+   - X
+   - 小红书
+   - lofter
+   - 后续扩展更多平台
+2. 下载入库
+   - 下载图片到本地
+   - 记录来源、作者、帖子链接、原始 tag
+   - 文件去重
+3. 自动审核
+   - 判断 tag 是否像角色名
+   - 调用多模态模型判断图片是否符合角色 tag
+   - 结果分为：通过 / 存疑 / 拒绝
+4. 多图帖子处理
+   - 以单图为审核粒度
+   - 避免帖子公共 tag 直接污染所有图片 tag
+
+---
+
+### 第三期：WebUI 管理
+目标：可视化管理图库和审核流程。
+
+功能范围：
+
+1. 图库浏览
+   - 按 tag/别名/来源/状态搜索
+   - 模糊搜索
+2. tag 管理
+   - 主 tag
+   - 别名
+   - 是否角色名
+3. 审核台
+   - 查看自动审核结果
+   - 手动通过/驳回
+   - 修改图片 tag
+4. 采集任务管理
+   - 新建任务
+   - 查看进度
+   - 失败重试
+
+---
+
+## 模块拆分建议
+
+### A. 运行时发图插件
+负责：
+
+- 接收消息
+- 解析 tag
+- 查询图库
+- 发送图片
+
+### B. 图库管理内核
+负责：
+
+- SQLite 索引
+- tag/别名管理
+- 去重
+- 随机选图
+
+### C. 采集审核模块
+负责：
+
+- 爬虫适配
+- 下载队列
+- 自动打标
+- 自动审核
+
+### D. WebUI 模块
+负责：
+
+- 搜索与检索
+- 配置管理
+- 审核与修正
+
+---
+
+## 数据模型建议
+
+### images
+- id
+- file_path
+- sha256
+- phash
+- width
+- height
+- status
+- created_at
+
+### tags
+- id
+- name
+- normalized_name
+- is_character
+- created_at
+
+### tag_aliases
+- id
+- tag_id
+- alias
+- normalized_alias
+
+### image_tags
+- image_id
+- tag_id
+- source
+- score
+- review_status
+
+### sources
+- image_id
+- platform
+- post_url
+- author
+- raw_tags
+
+### crawl_jobs
+- id
+- platform
+- status
+- progress
+- error_log
+- created_at
+
+### review_tasks
+- id
+- image_id
+- target_tag
+- model_result
+- manual_result
+- created_at
+
+### send_logs
+- id
+- session_id
+- image_id
+- tag
+- sent_at
+
+---
+
+## 开发顺序建议
+
+### Milestone 1
+- 本地图库随机发图
+- tag/alias
+- SQLite 索引
+- 基础命令
+
+### Milestone 2
+- LLM Tool 自然语言发图
+- 去重策略
+- 发送日志
+- 权限控制
+
+### Milestone 3
+- 本地扫描器/批量导入器
+- 数据修复命令
+
+### Milestone 4
+- 爬虫适配层
+- 下载队列
+- 自动审核
+
+### Milestone 5
+- WebUI 管理页
+
+---
+
+## 当前推荐
+先做第一期 MVP，优先验证：
+
+1. 本地图库组织是否顺手
+2. tag/alias 模型是否够用
+3. 规则触发 + LLM Tool 触发是否稳定
+4. 数据库结构是否能支撑后续扩展

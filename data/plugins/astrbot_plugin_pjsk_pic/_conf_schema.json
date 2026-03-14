@@ -1,0 +1,37 @@
+{
+  "library_root": {
+    "type": "string",
+    "description": "本地图库根目录。留空时默认使用插件数据目录下的 library 文件夹。",
+    "default": ""
+  },
+  "scan_on_startup": {
+    "type": "bool",
+    "description": "AstrBot 启动后是否自动扫描图库。",
+    "default": true
+  },
+  "allow_fuzzy_match": {
+    "type": "bool",
+    "description": "是否允许模糊匹配 tag 和别名。",
+    "default": true
+  },
+  "recent_dedupe_count": {
+    "type": "int",
+    "description": "每个会话最近去重的图片数量。",
+    "default": 20
+  },
+  "enable_llm_tool": {
+    "type": "bool",
+    "description": "是否开启 LLM 发图工具。",
+    "default": true
+  },
+  "ambiguous_candidate_limit": {
+    "type": "int",
+    "description": "模糊匹配存在多个候选时，最多展示几个候选 tag。",
+    "default": 5
+  },
+  "default_count": {
+    "type": "int",
+    "description": "LLM 工具默认发图数量。当前建议为 1。",
+    "default": 1
+  }
+}
