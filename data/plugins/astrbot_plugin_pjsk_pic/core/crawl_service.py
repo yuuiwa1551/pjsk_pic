@@ -121,68 +121,87 @@ class CrawlService:
         rejected_links = 0
         skipped_without_tags = 0
         similar_hits = 0
+        failed_candidates = 0
+        candidate_errors: list[str] = []
 
         for index, candidate in enumerate(candidates, start=1):
             progress = 10 + int(index / max(1, len(candidates)) * 80)
             self.db.update_crawl_job(job_id, progress=min(progress, 95))
+            try:
+                imported = await self.importer.import_candidate(candidate)
+                imported_count += 1
+                if imported.similar_image_ids:
+                    similar_hits += 1
+                self.db.upsert_source(
+                    image_id=imported.image_id,
+                    platform=platform,
+                    post_url=candidate.normalized_post_url or candidate.post_url,
+                    image_url=candidate.image_url,
+                    author=candidate.author,
+                    raw_tags=candidate.raw_tags,
+                    extra_json={
+                        "title": candidate.title,
+                        "source_uid": candidate.source_uid,
+                        "similar_image_ids": imported.similar_image_ids,
+                        **(candidate.extra or {}),
+                    },
+                )
 
-            imported = await self.importer.import_candidate(candidate)
-            imported_count += 1
-            if imported.similar_image_ids:
-                similar_hits += 1
-            self.db.upsert_source(
-                image_id=imported.image_id,
-                platform=platform,
-                post_url=candidate.normalized_post_url or candidate.post_url,
-                image_url=candidate.image_url,
-                author=candidate.author,
-                raw_tags=candidate.raw_tags,
-                extra_json={
-                    "title": candidate.title,
-                    "source_uid": candidate.source_uid,
-                    "similar_image_ids": imported.similar_image_ids,
-                    **(candidate.extra or {}),
-                },
-            )
+                tags = self.tag_cleaner.clean_tags(self._merge_tags(manual_tags, candidate.raw_tags), platform=platform)
+                if not tags:
+                    skipped_without_tags += 1
+                    continue
 
-            tags = self.tag_cleaner.clean_tags(self._merge_tags(manual_tags, candidate.raw_tags), platform=platform)
-            if not tags:
-                skipped_without_tags += 1
+                for tag_name in tags[: max(1, int(self.config.get("max_tags_per_image", 12) or 12))]:
+                    tag_id = self.db.get_or_create_tag(tag_name)
+                    decision = await self.reviewer.review_image_for_tag(imported.file_path, tag_name)
+                    self.db.link_image_tag(
+                        imported.image_id,
+                        tag_id,
+                        source_type=f"crawl:{platform}",
+                        review_status=decision.status,
+                        score=decision.confidence,
+                        review_reason=decision.reason,
+                    )
+                    tag_links += 1
+                    if decision.status in {"pending", "uncertain", "rejected"}:
+                        pending_reviews += 1
+                        self.db.create_review_task(
+                            imported.image_id,
+                            tag_id,
+                            decision.status,
+                            model_result=decision.raw_result,
+                            reason=decision.reason,
+                        )
+                    elif self.reviewer.is_character_tag(tag_name):
+                        self.db.create_review_task(
+                            imported.image_id,
+                            tag_id,
+                            decision.status,
+                            model_result=decision.raw_result,
+                            reason=decision.reason,
+                        )
+                    if decision.status in {"approved", "manual_approved"}:
+                        approved_links += 1
+                    if decision.status in {"rejected", "manual_rejected"}:
+                        rejected_links += 1
+            except Exception as exc:
+                failed_candidates += 1
+                message = f"候选图 #{index} 处理失败: {exc}"
+                if len(candidate_errors) < 3:
+                    candidate_errors.append(message)
+                logger.warning(f"[PJSKPic] 采集任务 #{job_id} {message}", exc_info=True)
                 continue
 
-            for tag_name in tags[: max(1, int(self.config.get("max_tags_per_image", 12) or 12))]:
-                tag_id = self.db.get_or_create_tag(tag_name)
-                decision = await self.reviewer.review_image_for_tag(imported.file_path, tag_name)
-                self.db.link_image_tag(
-                    imported.image_id,
-                    tag_id,
-                    source_type=f"crawl:{platform}",
-                    review_status=decision.status,
-                    score=decision.confidence,
-                    review_reason=decision.reason,
-                )
-                tag_links += 1
-                if decision.status in {"pending", "uncertain", "rejected"}:
-                    pending_reviews += 1
-                    self.db.create_review_task(
-                        imported.image_id,
-                        tag_id,
-                        decision.status,
-                        model_result=decision.raw_result,
-                        reason=decision.reason,
-                    )
-                elif self.reviewer.is_character_tag(tag_name):
-                    self.db.create_review_task(
-                        imported.image_id,
-                        tag_id,
-                        decision.status,
-                        model_result=decision.raw_result,
-                        reason=decision.reason,
-                    )
-                if decision.status in {"approved", "manual_approved"}:
-                    approved_links += 1
-                if decision.status in {"rejected", "manual_rejected"}:
-                    rejected_links += 1
+        if imported_count == 0 and failed_candidates > 0:
+            self.db.update_crawl_job(
+                job_id,
+                status="failed",
+                progress=0,
+                error_log="；".join(candidate_errors) or "候选图片处理失败",
+                result_summary=f"候选图 {len(candidates)} 张，全部处理失败",
+            )
+            return
 
         summary = (
             f"图片 {imported_count} 张，标签关联 {tag_links} 条，"
@@ -192,7 +211,15 @@ class CrawlService:
             summary += f"，无 tag 图片 {skipped_without_tags}"
         if similar_hits:
             summary += f"，疑似重复 {similar_hits}"
-        self.db.update_crawl_job(job_id, status="completed", progress=100, result_summary=summary)
+        if failed_candidates:
+            summary += f"，失败 {failed_candidates}"
+        self.db.update_crawl_job(
+            job_id,
+            status="completed",
+            progress=100,
+            result_summary=summary,
+            error_log="；".join(candidate_errors) if candidate_errors else "",
+        )
 
     @staticmethod
     def _parse_tags_text(tags_text: str) -> list[str]:

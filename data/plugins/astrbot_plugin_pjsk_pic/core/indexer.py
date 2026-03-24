@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+from astrbot.api import logger
 from PIL import Image
 
 from .db import ImageIndexDB
@@ -59,12 +60,14 @@ class LibraryIndexer:
                     width=width,
                     height=height,
                     format_=format_,
+                    storage_type="library",
                 )
                 tag_id = self.db.get_or_create_tag(tag_name)
                 self.db.link_image_tag(image_id, tag_id, source_type="directory")
                 inserted_or_updated += 1
                 linked += 1
-            except Exception:
+            except Exception as exc:
+                logger.warning(f"[PJSKPic] 扫描图片失败，已跳过: {file_path_resolved} ({exc})")
                 skipped += 1
 
         missing = self.db.mark_missing_files_inactive(str(library_root), seen_paths)

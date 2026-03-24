@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+import socket
 from pathlib import Path
 
-from quart import Response, jsonify, request, send_file
+from aiohttp import web
+from astrbot.api import logger
 
 from .db import ImageIndexDB
 
@@ -31,12 +34,14 @@ HTML_PAGE = """<!DOCTYPE html>
     .item { border: 1px solid #eceef2; border-radius: 8px; padding: 10px; }
     .muted { color: #666; font-size: 12px; }
     .pill { display: inline-block; background: #eef2ff; color: #2f52d6; border-radius: 999px; padding: 2px 8px; margin: 2px 4px 2px 0; }
+    .notice { margin-top: 8px; font-size: 12px; color: #dce4ff; }
   </style>
 </head>
 <body>
 <header>
   <h1 style="margin:0;">PJSK 图片库管理台</h1>
-  <div class="muted" style="color:#dce4ff;">支持图库检索、tag/别名管理、审核任务、采集任务与平台来源信息查看</div>
+  <div class="muted" style="color:#dce4ff;">独立 WebUI：支持图库检索、tag/别名管理、审核任务、采集任务与平台来源信息查看</div>
+  <div class="notice" id="notice"></div>
 </header>
 <main>
   <div>
@@ -50,7 +55,7 @@ HTML_PAGE = """<!DOCTYPE html>
         <input id="keyword" placeholder="关键词 / tag / alias" style="flex:1;" />
         <input id="tag" placeholder="精确 tag" />
         <select id="status"><option value="">全部状态</option><option>approved</option><option>manual_approved</option><option>pending</option><option>uncertain</option><option>rejected</option><option>manual_rejected</option></select>
-        <select id="platform"><option value="">全部平台</option><option>pixiv</option><option>x</option><option>xiaohongshu</option><option>generic</option></select>
+        <select id="platform"><option value="">全部平台</option><option>pixiv</option><option>x</option><option>xiaohongshu</option><option>generic</option><option>submission</option></select>
         <button onclick="loadImages()">搜索</button>
       </div>
       <div class="grid" id="images"></div>
@@ -99,18 +104,31 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
 </main>
 <script>
-const base = location.pathname.replace(/\\/ui$/, '');
-const api = (path) => `${base}${path}`;
+const params = new URLSearchParams(location.search);
+const token = params.get('token') || '';
+document.getElementById('notice').textContent = token ? '当前已附带访问令牌。' : '当前未附带访问令牌。';
+
+function api(path) {
+  const url = new URL(path, location.origin);
+  if (token) url.searchParams.set('token', token);
+  return url.toString();
+}
+
 async function fetchJson(path, options = {}) {
-  const resp = await fetch(api(path), {headers: {'Content-Type': 'application/json'}, ...options});
+  const headers = {'Content-Type': 'application/json', ...(options.headers || {})};
+  if (token) headers['X-PJSK-Token'] = token;
+  const resp = await fetch(api(path), {...options, headers});
   if (!resp.ok) throw new Error(await resp.text());
   return await resp.json();
 }
+
 function renderStats(stats) {
   const items = [['图片', stats.images], ['tag', stats.tags], ['alias', stats.aliases], ['采集任务', stats.crawl_jobs], ['待审核', stats.pending_reviews]];
   document.getElementById('stats').innerHTML = items.map(([k,v]) => `<div class="stat"><div class="muted">${k}</div><div style="font-size:22px;font-weight:bold;">${v}</div></div>`).join('');
 }
+
 async function loadSummary() { renderStats(await fetchJson('/api/summary')); }
+
 async function loadImages() {
   const q = new URLSearchParams({
     keyword: document.getElementById('keyword').value,
@@ -134,6 +152,7 @@ async function loadImages() {
     </div>
   `).join('') || '<div class="muted">暂无结果</div>';
 }
+
 async function loadJobs() {
   const data = await fetchJson('/api/jobs');
   document.getElementById('jobs').innerHTML = (data.items || []).map(item => `
@@ -146,6 +165,7 @@ async function loadJobs() {
     </div>
   `).join('') || '<div class="muted">暂无任务</div>';
 }
+
 async function createJob() {
   await fetchJson('/api/jobs', {method: 'POST', body: JSON.stringify({
     platform: document.getElementById('jobPlatform').value,
@@ -154,10 +174,12 @@ async function createJob() {
   })});
   await loadJobs(); await loadSummary();
 }
+
 async function retryJob(jobId) {
   await fetchJson('/api/jobs/retry', {method: 'POST', body: JSON.stringify({job_id: jobId})});
   await loadJobs();
 }
+
 async function loadReviews() {
   const q = new URLSearchParams({status: document.getElementById('reviewStatus').value, limit: '20'});
   const data = await fetchJson(`/api/reviews?${q.toString()}`);
@@ -173,10 +195,12 @@ async function loadReviews() {
     </div>
   `).join('') || '<div class="muted">暂无审核任务</div>';
 }
+
 async function reviewDecision(reviewId, approved) {
   await fetchJson('/api/reviews/decision', {method: 'POST', body: JSON.stringify({review_id: reviewId, approved})});
   await loadReviews(); await loadImages(); await loadSummary();
 }
+
 async function loadTags() {
   const q = new URLSearchParams({keyword: document.getElementById('tagSearch').value, limit: '50'});
   const data = await fetchJson(`/api/tags?${q.toString()}`);
@@ -188,18 +212,22 @@ async function loadTags() {
     </div>
   `).join('') || '<div class="muted">暂无 tag</div>';
 }
+
 async function addAlias() {
   await fetchJson('/api/tag/alias', {method: 'POST', body: JSON.stringify({tag_name: document.getElementById('aliasTag').value, alias: document.getElementById('aliasValue').value})});
   await loadTags();
 }
+
 async function removeAlias() {
   await fetchJson('/api/tag/alias', {method: 'DELETE', body: JSON.stringify({tag_name: document.getElementById('aliasTag').value, alias: document.getElementById('aliasValue').value})});
   await loadTags();
 }
+
 async function setCharacter() {
   await fetchJson('/api/tag/character', {method: 'POST', body: JSON.stringify({tag_name: document.getElementById('charTag').value, is_character: document.getElementById('charValue').value === 'true'})});
   await loadTags();
 }
+
 Promise.all([loadSummary(), loadImages(), loadJobs(), loadReviews(), loadTags()]).catch(err => { console.error(err); alert(err.message || err); });
 </script>
 </body>
@@ -211,30 +239,149 @@ class GalleryWebUI:
     def __init__(self, db: ImageIndexDB, crawl_service) -> None:
         self.db = db
         self.crawl_service = crawl_service
-        self.route_prefix = "/pjsk_pic"
+        self.host = "0.0.0.0"
+        self.port = 6199
+        self.access_token = ""
+        self._runner: web.AppRunner | None = None
+        self._site: web.BaseSite | None = None
+        self._actual_port: int | None = None
 
-    def register(self, context) -> None:
-        context.register_web_api(f"{self.route_prefix}/ui", self.ui_page, ["GET"], "PJSK 图片库 WebUI")
-        context.register_web_api(f"{self.route_prefix}/api/summary", self.api_summary, ["GET"], "PJSK 图片库统计")
-        context.register_web_api(f"{self.route_prefix}/api/images", self.api_images, ["GET"], "PJSK 图片检索")
-        context.register_web_api(f"{self.route_prefix}/api/image", self.api_image_detail, ["GET"], "PJSK 图片详情")
-        context.register_web_api(f"{self.route_prefix}/api/image-file", self.api_image_file, ["GET"], "PJSK 图片文件")
-        context.register_web_api(f"{self.route_prefix}/api/tags", self.api_tags, ["GET"], "PJSK tag 列表")
-        context.register_web_api(f"{self.route_prefix}/api/jobs", self.api_jobs, ["GET", "POST"], "PJSK 采集任务")
-        context.register_web_api(f"{self.route_prefix}/api/jobs/retry", self.api_jobs_retry, ["POST"], "PJSK 重试采集任务")
-        context.register_web_api(f"{self.route_prefix}/api/reviews", self.api_reviews, ["GET"], "PJSK 审核列表")
-        context.register_web_api(f"{self.route_prefix}/api/reviews/decision", self.api_review_decision, ["POST"], "PJSK 审核处理")
-        context.register_web_api(f"{self.route_prefix}/api/tag/alias", self.api_tag_alias, ["POST", "DELETE"], "PJSK 别名管理")
-        context.register_web_api(f"{self.route_prefix}/api/tag/character", self.api_tag_character, ["POST"], "PJSK 角色标记")
+    @property
+    def is_running(self) -> bool:
+        return self._runner is not None
 
-    async def ui_page(self):
-        return Response(HTML_PAGE, mimetype="text/html; charset=utf-8")
+    async def start(self, *, host: str, port: int, access_token: str = "") -> None:
+        self.host = str(host or "0.0.0.0").strip() or "0.0.0.0"
+        self.port = max(1, int(port or 6199))
+        self.access_token = str(access_token or "").strip()
 
-    async def api_summary(self):
-        return jsonify(self.db.get_stats())
+        if self.is_running:
+            return
 
-    async def api_images(self):
-        args = request.args
+        app = web.Application()
+        app.add_routes(
+            [
+                web.get("/", self.ui_page),
+                web.get("/api/summary", self.api_summary),
+                web.get("/api/images", self.api_images),
+                web.get("/api/image", self.api_image_detail),
+                web.get("/api/image-file", self.api_image_file),
+                web.get("/api/tags", self.api_tags),
+                web.get("/api/jobs", self.api_jobs),
+                web.post("/api/jobs", self.api_jobs),
+                web.post("/api/jobs/retry", self.api_jobs_retry),
+                web.get("/api/reviews", self.api_reviews),
+                web.post("/api/reviews/decision", self.api_review_decision),
+                web.post("/api/tag/alias", self.api_tag_alias),
+                web.delete("/api/tag/alias", self.api_tag_alias),
+                web.post("/api/tag/character", self.api_tag_character),
+            ]
+        )
+
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
+        site = web.TCPSite(runner, host=self.host, port=self.port)
+        await site.start()
+
+        self._runner = runner
+        self._site = site
+        sockets = getattr(getattr(site, "_server", None), "sockets", None) or []
+        if sockets:
+            self._actual_port = int(sockets[0].getsockname()[1])
+        else:
+            self._actual_port = self.port
+
+        for url in self.get_access_urls():
+            logger.info(f"[PJSKPic] 独立 WebUI 已启动: {url}")
+        if self.host in {"0.0.0.0", "::"} and not self.access_token:
+            logger.warning("[PJSKPic] 独立 WebUI 当前对局域网开放且未配置 webui_access_token，请注意访问安全。")
+
+    async def stop(self) -> None:
+        if self._runner is None:
+            return
+        try:
+            await self._runner.cleanup()
+        finally:
+            self._runner = None
+            self._site = None
+            self._actual_port = None
+
+    def get_access_urls(self) -> list[str]:
+        port = self._actual_port or self.port
+        token_suffix = f"?token={self.access_token}" if self.access_token else ""
+
+        if self.host in {"0.0.0.0", "::"}:
+            urls = [f"http://127.0.0.1:{port}/{token_suffix}"]
+            lan_ip = self._detect_lan_ip()
+            if lan_ip:
+                urls.insert(0, f"http://{lan_ip}:{port}/{token_suffix}")
+            return urls
+        return [f"http://{self.host}:{port}/{token_suffix}"]
+
+    @staticmethod
+    def _detect_lan_ip() -> str:
+        sock: socket.socket | None = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.connect(("8.8.8.8", 80))
+            return str(sock.getsockname()[0])
+        except OSError:
+            return ""
+        finally:
+            if sock:
+                sock.close()
+
+    def _check_access(self, request: web.Request) -> web.Response | None:
+        if not self.access_token:
+            return None
+        token = (
+            request.query.get("token", "")
+            or request.headers.get("X-PJSK-Token", "")
+            or self._bearer_token(request.headers.get("Authorization", ""))
+        )
+        if token == self.access_token:
+            return None
+        return self._json_response({"ok": False, "message": "forbidden"}, status=403)
+
+    @staticmethod
+    def _bearer_token(value: str) -> str:
+        text = str(value or "").strip()
+        if text.lower().startswith("bearer "):
+            return text[7:].strip()
+        return ""
+
+    def _json_response(self, payload: dict, *, status: int = 200) -> web.Response:
+        return web.Response(
+            text=json.dumps(payload, ensure_ascii=False),
+            status=status,
+            content_type="application/json",
+            charset="utf-8",
+        )
+
+    async def _json_body(self, request: web.Request) -> dict:
+        try:
+            data = await request.json()
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    async def ui_page(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied:
+            return denied
+        return web.Response(text=HTML_PAGE, content_type="text/html", charset="utf-8")
+
+    async def api_summary(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied:
+            return denied
+        return self._json_response(self.db.get_stats())
+
+    async def api_images(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied:
+            return denied
+        args = request.query
         rows = self.db.search_images(
             keyword=args.get("keyword", ""),
             review_status=args.get("review_status", ""),
@@ -243,7 +390,7 @@ class GalleryWebUI:
             limit=min(max(int(args.get("limit", 30) or 30), 1), 100),
             offset=max(int(args.get("offset", 0) or 0), 0),
         )
-        items = []
+        items: list[dict] = []
         for row in rows:
             detail = self.db.get_image_detail(int(row["id"])) or {}
             sources = detail.get("sources", [])
@@ -264,46 +411,62 @@ class GalleryWebUI:
                     "similar_image_ids": source0.get("extra", {}).get("similar_image_ids", []),
                 }
             )
-        return jsonify({"items": items})
+        return self._json_response({"items": items})
 
-    async def api_image_detail(self):
-        image_id = int(request.args.get("image_id", 0) or 0)
+    async def api_image_detail(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied:
+            return denied
+        image_id = int(request.query.get("image_id", 0) or 0)
         detail = self.db.get_image_detail(image_id)
         if not detail:
-            return jsonify({"error": "image_not_found"}), 404
-        return jsonify(detail)
+            return self._json_response({"error": "image_not_found"}, status=404)
+        return self._json_response(detail)
 
-    async def api_image_file(self):
-        image_id = int(request.args.get("image_id", 0) or 0)
+    async def api_image_file(self, request: web.Request) -> web.StreamResponse:
+        denied = self._check_access(request)
+        if denied:
+            return denied
+        image_id = int(request.query.get("image_id", 0) or 0)
         detail = self.db.get_image_detail(image_id)
         if not detail:
-            return jsonify({"error": "image_not_found"}), 404
-        path = Path(str(detail["image"]["file_path"]))
+            return self._json_response({"error": "image_not_found"}, status=404)
+        resolved_path = self.db.get_image_file_path(image_id)
+        path = Path(resolved_path) if resolved_path else Path(str(detail["image"]["file_path"]))
         if not path.exists():
-            return jsonify({"error": "file_not_found"}), 404
-        return await send_file(path)
+            return self._json_response({"error": "file_not_found"}, status=404)
+        return web.FileResponse(path)
 
-    async def api_tags(self):
-        args = request.args
-        rows = self.db.list_tags(keyword=args.get("keyword", ""), limit=min(max(int(args.get("limit", 50) or 50), 1), 200))
-        items = []
-        for row in rows:
-            items.append(
-                {
-                    "id": int(row["id"]),
-                    "name": str(row["name"]),
-                    "is_character": bool(row["is_character"]),
-                    "image_count": int(row["image_count"] or 0),
-                    "aliases": self.db.list_aliases(str(row["name"])),
-                }
-            )
-        return jsonify({"items": items})
+    async def api_tags(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied:
+            return denied
+        args = request.query
+        rows = self.db.list_tags(
+            keyword=args.get("keyword", ""),
+            limit=min(max(int(args.get("limit", 50) or 50), 1), 200),
+        )
+        items = [
+            {
+                "id": int(row["id"]),
+                "name": str(row["name"]),
+                "is_character": bool(row["is_character"]),
+                "image_count": int(row["image_count"] or 0),
+                "aliases": self.db.list_aliases(str(row["name"])),
+            }
+            for row in rows
+        ]
+        return self._json_response({"items": items})
 
-    async def api_jobs(self):
+    async def api_jobs(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied:
+            return denied
         if request.method == "GET":
             rows = self.db.list_crawl_jobs(limit=50)
-            return jsonify({"items": [dict(row) for row in rows]})
-        data = await self._json_body()
+            return self._json_response({"items": [dict(row) for row in rows]})
+
+        data = await self._json_body(request)
         try:
             job_id = await self.crawl_service.submit_job(
                 str(data.get("platform", "")).strip(),
@@ -311,46 +474,62 @@ class GalleryWebUI:
                 self._parse_tags_text(str(data.get("tags", ""))),
             )
         except Exception as exc:
-            return jsonify({"ok": False, "message": str(exc)}), 400
-        return jsonify({"ok": True, "job_id": job_id})
+            return self._json_response({"ok": False, "message": str(exc)}, status=400)
+        return self._json_response({"ok": True, "job_id": job_id})
 
-    async def api_jobs_retry(self):
-        data = await self._json_body()
+    async def api_jobs_retry(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied:
+            return denied
+        data = await self._json_body(request)
         ok, message = await self.crawl_service.retry_job(int(data.get("job_id", 0) or 0))
-        return jsonify({"ok": ok, "message": message}), (200 if ok else 400)
+        return self._json_response({"ok": ok, "message": message}, status=(200 if ok else 400))
 
-    async def api_reviews(self):
-        args = request.args
+    async def api_reviews(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied:
+            return denied
+        args = request.query
         rows = self.db.list_review_tasks(
             status=args.get("status", "") or None,
             limit=min(max(int(args.get("limit", 20) or 20), 1), 100),
         )
-        return jsonify({"items": [dict(row) for row in rows]})
+        return self._json_response({"items": [dict(row) for row in rows]})
 
-    async def api_review_decision(self):
-        data = await self._json_body()
-        ok, message = self.db.apply_manual_review(int(data.get("review_id", 0) or 0), approved=bool(data.get("approved", False)))
-        return jsonify({"ok": ok, "message": message}), (200 if ok else 400)
+    async def api_review_decision(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied:
+            return denied
+        data = await self._json_body(request)
+        ok, message = self.db.apply_manual_review(
+            int(data.get("review_id", 0) or 0),
+            approved=bool(data.get("approved", False)),
+        )
+        return self._json_response({"ok": ok, "message": message}, status=(200 if ok else 400))
 
-    async def api_tag_alias(self):
-        data = await self._json_body()
+    async def api_tag_alias(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied:
+            return denied
+        data = await self._json_body(request)
         tag_name = str(data.get("tag_name", "")).strip()
         alias = str(data.get("alias", "")).strip()
         if request.method == "POST":
             ok, message = self.db.add_alias(tag_name, alias)
         else:
             ok, message = self.db.remove_alias(tag_name, alias)
-        return jsonify({"ok": ok, "message": message}), (200 if ok else 400)
+        return self._json_response({"ok": ok, "message": message}, status=(200 if ok else 400))
 
-    async def api_tag_character(self):
-        data = await self._json_body()
-        ok, message = self.db.set_tag_character(str(data.get("tag_name", "")).strip(), bool(data.get("is_character", False)))
-        return jsonify({"ok": ok, "message": message}), (200 if ok else 400)
-
-    @staticmethod
-    async def _json_body() -> dict:
-        data = await request.get_json(silent=True)
-        return data if isinstance(data, dict) else {}
+    async def api_tag_character(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied:
+            return denied
+        data = await self._json_body(request)
+        ok, message = self.db.set_tag_character(
+            str(data.get("tag_name", "")).strip(),
+            bool(data.get("is_character", False)),
+        )
+        return self._json_response({"ok": ok, "message": message}, status=(200 if ok else 400))
 
     @staticmethod
     def _parse_tags_text(tags_text: str) -> list[str]:

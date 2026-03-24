@@ -46,7 +46,6 @@ class PJSKPicPlugin(Star):
         self.recent_by_session: dict[str, deque[int]] = defaultdict(
             lambda: deque(maxlen=self._dedupe_count()),
         )
-        self._webui_registered = False
 
     async def initialize(self) -> None:
         library_root = self._library_root()
@@ -57,11 +56,18 @@ class PJSKPicPlugin(Star):
             except Exception as exc:
                 logger.error(f"[PJSKPic] 启动扫描失败: {exc}", exc_info=True)
         await self.crawl_service.start()
-        if not self._webui_registered:
-            self.webui.register(self.context)
-            self._webui_registered = True
+        if self._webui_enabled():
+            try:
+                await self.webui.start(
+                    host=self._webui_host(),
+                    port=self._webui_port(),
+                    access_token=self._webui_access_token(),
+                )
+            except Exception as exc:
+                logger.error(f"[PJSKPic] 独立 WebUI 启动失败: {exc}", exc_info=True)
 
     async def terminate(self) -> None:
+        await self.webui.stop()
         await self.crawl_service.stop()
 
     def _library_root(self) -> Path:
@@ -77,6 +83,19 @@ class PJSKPicPlugin(Star):
     def _crawler_timeout(self) -> int:
         value = int(self.config.get("platform_request_timeout", self.config.get("crawler_timeout_seconds", 20)) or 20)
         return max(5, value)
+
+    def _webui_enabled(self) -> bool:
+        return bool(self.config.get("webui_enabled", True))
+
+    def _webui_host(self) -> str:
+        return str(self.config.get("webui_host", "0.0.0.0") or "0.0.0.0").strip() or "0.0.0.0"
+
+    def _webui_port(self) -> int:
+        value = int(self.config.get("webui_port", 6199) or 6199)
+        return min(max(1, value), 65535)
+
+    def _webui_access_token(self) -> str:
+        return str(self.config.get("webui_access_token", "") or "").strip()
 
     def _recent_queue(self, session_id: str) -> deque[int]:
         key = session_id or "default"
@@ -128,7 +147,11 @@ class PJSKPicPlugin(Star):
                     return "empty_tag"
                 break
 
-            image_path = Path(str(row["file_path"]))
+            resolved_path = self.db.get_image_file_path(int(row["id"]))
+            if not resolved_path:
+                continue
+
+            image_path = Path(resolved_path)
             if not image_path.exists():
                 continue
 
@@ -307,6 +330,23 @@ class PJSKPicPlugin(Star):
     async def reject_review_task(self, event: AstrMessageEvent, review_id: int):
         ok, message = self.db.apply_manual_review(int(review_id), approved=False)
         yield event.plain_result(message if ok else f"处理失败：{message}")
+
+    @pjsk_gallery.command("面板地址")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def show_webui_address(self, event: AstrMessageEvent):
+        if not self._webui_enabled():
+            yield event.plain_result("独立 WebUI 当前已禁用。")
+            return
+        urls = self.webui.get_access_urls()
+        if not urls:
+            yield event.plain_result("独立 WebUI 当前未启动。")
+            return
+        lines = ["PJSK 独立 WebUI 地址：", *urls]
+        if self._webui_access_token():
+            lines.append("当前已启用访问令牌。")
+        else:
+            lines.append("当前未配置访问令牌；若开放局域网访问，请注意安全。")
+        yield event.plain_result("\n".join(lines))
 
     @staticmethod
     def _parse_csv_tags(tags_csv: str) -> list[str]:

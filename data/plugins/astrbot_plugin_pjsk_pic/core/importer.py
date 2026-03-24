@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import imghdr
 import mimetypes
 import urllib.parse
 import urllib.request
@@ -84,6 +83,7 @@ class ImportedImageService:
             width=width,
             height=height,
             format_=format_name,
+            storage_type="imported",
         )
         return ImportedImage(
             image_id=image_id,
@@ -100,7 +100,7 @@ class ImportedImageService:
     def _read_image_meta(body: bytes) -> tuple[int, int, str]:
         with Image.open(BytesIO(body)) as image:
             width, height = image.size
-            format_name = str(image.format or "").lower() or (imghdr.what(None, h=body) or "bin")
+            format_name = str(image.format or "").lower() or "bin"
             return int(width), int(height), format_name
 
     @staticmethod

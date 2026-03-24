@@ -88,6 +88,18 @@ class ImageIndexDB:
                     FOREIGN KEY(tag_id) REFERENCES tags(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS image_files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    image_id INTEGER NOT NULL,
+                    file_path TEXT NOT NULL UNIQUE,
+                    file_name TEXT NOT NULL,
+                    storage_type TEXT NOT NULL DEFAULT 'library',
+                    is_active INTEGER DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(image_id) REFERENCES images(id)
+                );
+
                 CREATE TABLE IF NOT EXISTS sources (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     image_id INTEGER NOT NULL,
@@ -140,6 +152,8 @@ class ImageIndexDB:
 
                 CREATE INDEX IF NOT EXISTS idx_images_active ON images(is_active);
                 CREATE INDEX IF NOT EXISTS idx_images_sha256 ON images(sha256);
+                CREATE INDEX IF NOT EXISTS idx_image_files_image_id ON image_files(image_id);
+                CREATE INDEX IF NOT EXISTS idx_image_files_active ON image_files(is_active);
                 CREATE INDEX IF NOT EXISTS idx_image_tags_tag_id ON image_tags(tag_id);
                 CREATE INDEX IF NOT EXISTS idx_image_tags_review_status ON image_tags(review_status);
                 CREATE INDEX IF NOT EXISTS idx_sources_platform ON sources(platform);
@@ -156,33 +170,214 @@ class ImageIndexDB:
             self._ensure_column(conn, 'image_tags', 'review_reason', "TEXT DEFAULT ''")
             self._ensure_column(conn, 'image_tags', 'updated_at', "TEXT DEFAULT ''")
             self._ensure_column(conn, 'crawl_jobs', 'attempt_count', 'INTEGER DEFAULT 0')
+            self._ensure_file_locations_initialized(conn)
 
-    def upsert_image(self, *, file_path: str, file_name: str, sha256: str, width: int, height: int, format_: str, phash: str = '') -> int:
+    @staticmethod
+    def _infer_storage_type(file_path: str) -> str:
+        normalized = str(file_path or "").replace("\\", "/").lower()
+        if "/images/imported/" in normalized:
+            return "imported"
+        return "library"
+
+    def _ensure_file_locations_initialized(self, conn: sqlite3.Connection) -> None:
+        location_count = int(conn.execute("SELECT COUNT(*) AS c FROM image_files").fetchone()["c"])
+        if location_count > 0:
+            return
+        rows = conn.execute(
+            "SELECT id, file_path, file_name, is_active, created_at, updated_at FROM images",
+        ).fetchall()
+        for row in rows:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO image_files(image_id, file_path, file_name, storage_type, is_active, created_at, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(row["id"]),
+                    str(row["file_path"]),
+                    str(row["file_name"]),
+                    self._infer_storage_type(str(row["file_path"])),
+                    int(row["is_active"] or 0),
+                    str(row["created_at"]),
+                    str(row["updated_at"]),
+                ),
+            )
+
+    def _upsert_file_location(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        image_id: int,
+        file_path: str,
+        file_name: str,
+        storage_type: str,
+        now: str,
+    ) -> None:
+        row = conn.execute(
+            "SELECT id FROM image_files WHERE file_path = ? LIMIT 1",
+            (file_path,),
+        ).fetchone()
+        if row:
+            conn.execute(
+                """
+                UPDATE image_files
+                SET image_id = ?, file_name = ?, storage_type = ?, is_active = 1, updated_at = ?
+                WHERE id = ?
+                """,
+                (image_id, file_name, storage_type, now, row["id"]),
+            )
+            return
+        conn.execute(
+            """
+            INSERT INTO image_files(image_id, file_path, file_name, storage_type, is_active, created_at, updated_at)
+            VALUES(?, ?, ?, ?, 1, ?, ?)
+            """,
+            (image_id, file_path, file_name, storage_type, now, now),
+        )
+
+    def _sync_image_file_state(
+        self,
+        conn: sqlite3.Connection,
+        image_id: int,
+        *,
+        preferred_path: str | None = None,
+        now: str | None = None,
+    ) -> None:
+        now = now or utcnow_str()
+        image_row = conn.execute(
+            "SELECT file_path FROM images WHERE id = ? LIMIT 1",
+            (image_id,),
+        ).fetchone()
+        current_path = str(image_row["file_path"]) if image_row and image_row["file_path"] else ""
+        locations = conn.execute(
+            """
+            SELECT file_path, file_name
+            FROM image_files
+            WHERE image_id = ? AND is_active = 1
+            ORDER BY updated_at DESC, id DESC
+            """,
+            (image_id,),
+        ).fetchall()
+
+        chosen: sqlite3.Row | None = None
+        if current_path:
+            for row in locations:
+                if str(row["file_path"]) == current_path and Path(str(row["file_path"])).exists():
+                    chosen = row
+                    break
+        if chosen is None and preferred_path:
+            for row in locations:
+                if str(row["file_path"]) == preferred_path and Path(str(row["file_path"])).exists():
+                    chosen = row
+                    break
+        if chosen is None:
+            for row in locations:
+                try:
+                    if Path(str(row["file_path"])).exists():
+                        chosen = row
+                        break
+                except OSError:
+                    continue
+        if chosen is None and locations:
+            chosen = locations[0]
+
+        if chosen is not None:
+            conn.execute(
+                """
+                UPDATE images
+                SET file_path = ?, file_name = ?, is_active = 1, updated_at = ?
+                WHERE id = ?
+                """,
+                (str(chosen["file_path"]), str(chosen["file_name"]), now, image_id),
+            )
+            return
+
+        conn.execute(
+            "UPDATE images SET is_active = 0, updated_at = ? WHERE id = ?",
+            (now, image_id),
+        )
+
+    def upsert_image(
+        self,
+        *,
+        file_path: str,
+        file_name: str,
+        sha256: str,
+        width: int,
+        height: int,
+        format_: str,
+        phash: str = '',
+        storage_type: str = "library",
+    ) -> int:
         now = utcnow_str()
         with self._lock, self._connect() as conn:
-            row = conn.execute('SELECT id FROM images WHERE file_path = ?', (file_path,)).fetchone()
+            row = conn.execute(
+                "SELECT image_id FROM image_files WHERE file_path = ? LIMIT 1",
+                (file_path,),
+            ).fetchone()
             if row:
+                image_id = int(row["image_id"])
+                existing = conn.execute(
+                    "SELECT phash, width, height, format FROM images WHERE id = ? LIMIT 1",
+                    (image_id,),
+                ).fetchone()
+                next_phash = phash or str(existing["phash"] or "") if existing else phash
+                next_width = int(width or (existing["width"] if existing else 0) or 0)
+                next_height = int(height or (existing["height"] if existing else 0) or 0)
+                next_format = format_ or str(existing["format"] or "") if existing else format_
                 conn.execute(
                     """
                     UPDATE images
                     SET file_name = ?, sha256 = ?, phash = ?, width = ?, height = ?, format = ?, is_active = 1, updated_at = ?
                     WHERE id = ?
                     """,
-                    (file_name, sha256, phash, width, height, format_, now, row['id']),
+                    (file_name, sha256, next_phash, next_width, next_height, next_format, now, image_id),
                 )
-                return int(row['id'])
+                self._upsert_file_location(
+                    conn,
+                    image_id=image_id,
+                    file_path=file_path,
+                    file_name=file_name,
+                    storage_type=storage_type,
+                    now=now,
+                )
+                self._sync_image_file_state(conn, image_id, preferred_path=file_path, now=now)
+                return image_id
 
-            existing = conn.execute('SELECT id FROM images WHERE sha256 = ? LIMIT 1', (sha256,)).fetchone()
+            existing = conn.execute(
+                """
+                SELECT id, phash, width, height, format
+                FROM images
+                WHERE sha256 = ?
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (sha256,),
+            ).fetchone()
             if existing:
+                image_id = int(existing["id"])
+                next_phash = phash or str(existing["phash"] or "")
+                next_width = int(width or existing["width"] or 0)
+                next_height = int(height or existing["height"] or 0)
+                next_format = format_ or str(existing["format"] or "")
                 conn.execute(
                     """
                     UPDATE images
-                    SET file_path = ?, file_name = ?, phash = ?, width = ?, height = ?, format = ?, is_active = 1, updated_at = ?
+                    SET phash = ?, width = ?, height = ?, format = ?, is_active = 1, updated_at = ?
                     WHERE id = ?
                     """,
-                    (file_path, file_name, phash, width, height, format_, now, existing['id']),
+                    (next_phash, next_width, next_height, next_format, now, image_id),
                 )
-                return int(existing['id'])
+                self._upsert_file_location(
+                    conn,
+                    image_id=image_id,
+                    file_path=file_path,
+                    file_name=file_name,
+                    storage_type=storage_type,
+                    now=now,
+                )
+                self._sync_image_file_state(conn, image_id, preferred_path=file_path, now=now)
+                return image_id
 
             cursor = conn.execute(
                 """
@@ -191,7 +386,16 @@ class ImageIndexDB:
                 """,
                 (file_path, file_name, sha256, phash, width, height, format_, now, now),
             )
-            return int(cursor.lastrowid)
+            image_id = int(cursor.lastrowid)
+            self._upsert_file_location(
+                conn,
+                image_id=image_id,
+                file_path=file_path,
+                file_name=file_name,
+                storage_type=storage_type,
+                now=now,
+            )
+            return image_id
 
     def find_similar_images_by_phash(self, phash: str, *, max_distance: int = 8, limit: int = 10) -> list[sqlite3.Row]:
         if not phash:
@@ -218,11 +422,25 @@ class ImageIndexDB:
         root = str(Path(library_root).resolve())
         count = 0
         with self._lock, self._connect() as conn:
-            rows = conn.execute('SELECT id, file_path FROM images WHERE file_path LIKE ?', (f'{root}%',)).fetchall()
+            rows = conn.execute(
+                """
+                SELECT id, image_id, file_path
+                FROM image_files
+                WHERE storage_type = 'library' AND file_path LIKE ?
+                """,
+                (f'{root}%',),
+            ).fetchall()
+            affected_image_ids: set[int] = set()
             for row in rows:
                 if row['file_path'] not in seen_paths:
-                    conn.execute('UPDATE images SET is_active = 0, updated_at = ? WHERE id = ?', (utcnow_str(), row['id']))
+                    conn.execute(
+                        "UPDATE image_files SET is_active = 0, updated_at = ? WHERE id = ?",
+                        (utcnow_str(), row['id']),
+                    )
+                    affected_image_ids.add(int(row["image_id"]))
                     count += 1
+            for image_id in affected_image_ids:
+                self._sync_image_file_state(conn, image_id)
         return count
 
     def get_or_create_tag(self, tag_name: str, is_character: bool | None = None) -> int:
@@ -444,6 +662,15 @@ class ImageIndexDB:
                 (tag_id, *approved_params),
             ).fetchone()
 
+    def get_image_file_path(self, image_id: int) -> str | None:
+        with self._lock, self._connect() as conn:
+            self._sync_image_file_state(conn, image_id)
+            row = conn.execute(
+                "SELECT file_path FROM images WHERE id = ? AND is_active = 1",
+                (image_id,),
+            ).fetchone()
+            return str(row["file_path"]) if row and row["file_path"] else None
+
     def record_send_log(self, session_id: str, image_id: int, matched_tag: str) -> None:
         with self._lock, self._connect() as conn:
             conn.execute('INSERT INTO send_logs(session_id, image_id, matched_tag, sent_at) VALUES(?, ?, ?, ?)', (session_id, image_id, matched_tag, utcnow_str()))
@@ -635,6 +862,7 @@ class ImageIndexDB:
 
     def get_image_detail(self, image_id: int) -> dict[str, Any] | None:
         with self._lock, self._connect() as conn:
+            self._sync_image_file_state(conn, image_id)
             image = conn.execute('SELECT * FROM images WHERE id = ?', (image_id,)).fetchone()
             if not image:
                 return None
