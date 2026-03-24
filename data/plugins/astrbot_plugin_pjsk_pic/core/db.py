@@ -822,12 +822,14 @@ class ImageIndexDB:
                 "UPDATE review_tasks SET status = ?, manual_result = ?, reason = ?, updated_at = ? WHERE id = ?",
                 (new_status, 'approved' if approved else 'rejected', reason, utcnow_str(), review_id),
             )
+        source_type = str(task['source_type'] or '')
+        source_prefix = source_type.split(':', 1)[0] if source_type else None
         self.update_image_tag_review(
             int(task['image_id']),
             int(task['tag_id']),
             new_status,
             reason=reason or ('人工通过' if approved else '人工拒绝'),
-            source_type_prefix='crawl',
+            source_type_prefix=source_prefix,
         )
         return True, f"已{'通过' if approved else '拒绝'}审核任务 #{review_id}"
 

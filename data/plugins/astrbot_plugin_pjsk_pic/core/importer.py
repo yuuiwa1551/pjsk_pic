@@ -54,6 +54,9 @@ class ImportedImageService:
     async def import_candidate(self, candidate: CrawlCandidate) -> ImportedImage:
         return await asyncio.to_thread(self._import_candidate_sync, candidate)
 
+    async def import_local_file(self, source_path: str | Path, *, platform: str = "submission") -> ImportedImage:
+        return await asyncio.to_thread(self._import_local_file_sync, Path(source_path), platform)
+
     def _import_candidate_sync(self, candidate: CrawlCandidate) -> ImportedImage:
         headers = dict(DEFAULT_HEADERS)
         extra_headers = candidate.extra.get("request_headers", {}) if isinstance(candidate.extra, dict) else {}
@@ -64,12 +67,37 @@ class ImportedImageService:
             content_type = response.headers.get("Content-Type", "")
             final_url = response.geturl()
 
+        return self._store_imported_bytes(
+            body,
+            source_name=final_url,
+            content_type=content_type,
+            platform=candidate.platform,
+        )
+
+    def _import_local_file_sync(self, source_path: Path, platform: str) -> ImportedImage:
+        body = source_path.read_bytes()
+        guessed_type, _ = mimetypes.guess_type(source_path.name)
+        return self._store_imported_bytes(
+            body,
+            source_name=str(source_path),
+            content_type=guessed_type or "",
+            platform=platform,
+        )
+
+    def _store_imported_bytes(
+        self,
+        body: bytes,
+        *,
+        source_name: str,
+        content_type: str,
+        platform: str,
+    ) -> ImportedImage:
         sha256 = hashlib.sha256(body).hexdigest()
         width, height, format_name = self._read_image_meta(body)
         phash = compute_image_phash(body) if self.enable_phash_dedupe else ""
         similar_rows = self.db.find_similar_images_by_phash(phash, max_distance=self.phash_max_distance) if phash else []
-        extension = self._guess_extension(final_url, content_type, format_name)
-        file_dir = self.import_root / candidate.platform / sha256[:2]
+        extension = self._guess_extension(source_name, content_type, format_name)
+        file_dir = self.import_root / platform / sha256[:2]
         file_dir.mkdir(parents=True, exist_ok=True)
         file_path = file_dir / f"{sha256}{extension}"
         if not file_path.exists():

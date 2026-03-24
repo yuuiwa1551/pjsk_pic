@@ -7,6 +7,7 @@ from .matcher import extract_query_from_text, normalize_tag_name
 from .models import CrawlCandidate, ImportedImage, MatchResult, ReviewDecision
 from .phash import compute_image_phash, hamming_distance
 from .review_service import ReviewService
+from .submission_service import SubmissionService
 from .tag_cleaner import TagCleaner
 
 __all__ = [
@@ -21,6 +22,7 @@ __all__ = [
     "MatchResult",
     "ReviewDecision",
     "ReviewService",
+    "SubmissionService",
     "compute_image_phash",
     "extract_query_from_text",
     "hamming_distance",

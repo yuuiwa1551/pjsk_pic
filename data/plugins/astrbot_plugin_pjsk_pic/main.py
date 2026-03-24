@@ -16,6 +16,7 @@ from .core import (
     ImportedImageService,
     LibraryIndexer,
     ReviewService,
+    SubmissionService,
     extract_query_from_text,
 )
 from .core.webui import GalleryWebUI
@@ -42,6 +43,7 @@ class PJSKPicPlugin(Star):
             reviewer=self.reviewer,
             config=config,
         )
+        self.submission_service = SubmissionService(self.db, self.importer, self.reviewer)
         self.webui = GalleryWebUI(self.db, self.crawl_service)
         self.recent_by_session: dict[str, deque[int]] = defaultdict(
             lambda: deque(maxlen=self._dedupe_count()),
@@ -176,6 +178,16 @@ class PJSKPicPlugin(Star):
         result = await self._send_tag_image(event, query)
         if result is None:
             event.stop_event()
+
+    @filter.regex(r"(?:^|[\s])(?:[/!！.。．])?(?:投稿|tg)\s+.+")
+    async def submit_image_by_user(self, event: AstrMessageEvent):
+        tag_name = self.submission_service.extract_tag_from_text(event.message_str)
+        if not tag_name:
+            return
+        ok, message = await self.submission_service.submit_from_event(event, tag_name)
+        if message:
+            await event.send(MessageChain().message(message))
+        event.stop_event()
 
     @event_filter.llm_tool(name="send_local_image_by_tag")
     async def send_local_image_by_tag(self, event: AstrMessageEvent, tag: str, count: int = 1):
