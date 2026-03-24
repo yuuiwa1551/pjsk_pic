@@ -175,9 +175,8 @@ class PJSKPicPlugin(Star):
         query = extract_query_from_text(event.message_str)
         if not query:
             return
-        result = await self._send_tag_image(event, query)
-        if result is None:
-            event.stop_event()
+        await self._send_tag_image(event, query, silent_on_tool=True)
+        event.stop_event()
 
     @filter.regex(r"(?:^|[\s])(?:[/!！.。．])?(?:投稿|tg)\s+.+")
     async def submit_image_by_user(self, event: AstrMessageEvent):
