@@ -178,11 +178,35 @@ class PJSKPicPlugin(Star):
         await self._send_tag_image(event, query, silent_on_tool=True)
         event.stop_event()
 
-    @filter.regex("(?:^|[\\s])(?:[/!\uFF01.\u3002\uFF0E])?(?:\u6295\u7A3F|tg)\\s+.+")
-    async def submit_image_by_user(self, event: AstrMessageEvent):
-        request = self.submission_service.parse_submission_text(event.message_str)
+    def _parse_submission_request(self, raw_message: str):
+        request = self.submission_service.parse_submission_text(raw_message)
+        if request and request.tag_name:
+            return request
+        text = str(raw_message or "").strip()
+        if not text:
+            return None
+        candidates: list[str] = [text]
+        if " " in text:
+            body = text.partition(" ")[2].strip()
+            if body and body not in candidates:
+                candidates.append(body)
+        for candidate in candidates:
+            fallback = self.submission_service.parse_submission_text(f"\u6295\u7A3F {candidate}")
+            if fallback and fallback.tag_name:
+                return fallback
+        return None
+        fallback = self.submission_service.parse_submission_text(f"\u6295\u7A3F {body}")
+        if fallback and fallback.tag_name:
+            return fallback
+        return None
+
+    async def _handle_submission_event(self, event: AstrMessageEvent, *, missing_tag_reply: str | None = None) -> bool:
+        request = self._parse_submission_request(event.message_str)
         if not request or not request.tag_name:
-            return
+            if missing_tag_reply:
+                await event.send(MessageChain().message(missing_tag_reply))
+                event.stop_event()
+            return False
         ok, message = await self.submission_service.submit_from_event(
             event,
             request.tag_name,
@@ -191,6 +215,18 @@ class PJSKPicPlugin(Star):
         if message:
             await event.send(MessageChain().message(message))
         event.stop_event()
+        return bool(ok)
+
+    @filter.command("\u6295\u7A3F", alias={"tg"})
+    async def submit_image_by_user_command(self, event: AstrMessageEvent):
+        await self._handle_submission_event(
+            event,
+            missing_tag_reply="\u8BF7\u5728\u6295\u7A3F\u547D\u4EE4\u540E\u63D0\u4F9B\u89D2\u8272 tag\uFF0C\u4F8B\u5982\uFF1A/tg \u521D\u97F3\u672A\u6765",
+        )
+
+    @filter.regex("(?:^|[\\s])(?:\u6295\u7A3F|tg)\\s+.+")
+    async def submit_image_by_user(self, event: AstrMessageEvent):
+        await self._handle_submission_event(event)
 
     @event_filter.llm_tool(name="send_local_image_by_tag")
     async def send_local_image_by_tag(self, event: AstrMessageEvent, tag: str, count: int = 1):
