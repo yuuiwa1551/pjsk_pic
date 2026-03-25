@@ -26,6 +26,22 @@ class SubmissionRequest:
     aliases: list[str] = field(default_factory=list)
 
 
+@dataclass(slots=True)
+class SubmissionResult:
+    ok: bool
+    reply_message: str
+    tag_name: str = ""
+    image_id: int | None = None
+    review_id: int | None = None
+    aliases: list[str] = field(default_factory=list)
+    sender_id: str = ""
+    sender_name: str = ""
+    platform_name: str = ""
+    session_id: str = ""
+    message_id: str = ""
+    review_status: str = ""
+
+
 class SubmissionService:
     def __init__(self, db: ImageIndexDB, importer: ImportedImageService, reviewer: ReviewService) -> None:
         self.db = db
@@ -83,10 +99,13 @@ class SubmissionService:
             result.append(alias)
         return result
 
-    async def submit_from_event(self, event, tag_name: str, aliases: list[str] | None = None) -> tuple[bool, str]:
+    async def submit_from_event(self, event, tag_name: str, aliases: list[str] | None = None) -> SubmissionResult:
         clean_tag = str(tag_name or "").strip()
         if not clean_tag:
-            return False, "\u8BF7\u5728\u6295\u7A3F\u547D\u4EE4\u540E\u63D0\u4F9B\u89D2\u8272 tag\uFF0C\u4F8B\u5982\uFF1A\u6295\u7A3F \u521D\u97F3\u672A\u6765"
+            return SubmissionResult(
+                ok=False,
+                reply_message="\u8BF7\u5728\u6295\u7A3F\u547D\u4EE4\u540E\u63D0\u4F9B\u89D2\u8272 tag\uFF0C\u4F8B\u5982\uFF1A\u6295\u7A3F \u521D\u97F3\u672A\u6765",
+            )
 
         normalized_aliases: list[str] = []
         seen_aliases: set[str] = set()
@@ -100,9 +119,12 @@ class SubmissionService:
 
         image_paths = await self._extract_image_paths(event)
         if not image_paths:
-            return False, "\u6295\u7A3F\u65F6\u8BF7\u9644\u5E26 1 \u5F20\u56FE\u7247\u3002"
+            return SubmissionResult(ok=False, reply_message="\u6295\u7A3F\u65F6\u8BF7\u9644\u5E26 1 \u5F20\u56FE\u7247\u3002")
         if len(image_paths) > 1:
-            return False, "\u5F53\u524D\u6295\u7A3F\u4EC5\u652F\u6301\u5355\u56FE\uFF0C\u8BF7\u4E00\u6B21\u53EA\u53D1 1 \u5F20\u56FE\u7247\u3002"
+            return SubmissionResult(
+                ok=False,
+                reply_message="\u5F53\u524D\u6295\u7A3F\u4EC5\u652F\u6301\u5355\u56FE\uFF0C\u8BF7\u4E00\u6B21\u53EA\u53D1 1 \u5F20\u56FE\u7247\u3002",
+            )
 
         imported = await self.importer.import_local_file(image_paths[0], platform="submission")
         tag_existed = self.db.get_tag_row(clean_tag) is not None
@@ -187,7 +209,20 @@ class SubmissionService:
 
         if imported.similar_image_ids:
             lines.append("\u68C0\u6D4B\u5230\u7591\u4F3C\u91CD\u590D\u56FE\u7247\uFF1A" + "\u3001".join(str(item) for item in imported.similar_image_ids[:10]))
-        return True, "\\n".join(lines)
+        return SubmissionResult(
+            ok=True,
+            reply_message="\\n".join(lines),
+            tag_name=clean_tag,
+            image_id=imported.image_id,
+            review_id=review_id,
+            aliases=list(added_aliases),
+            sender_id=str(sender_id or ""),
+            sender_name=str(sender_name or ""),
+            platform_name=str(platform_name or ""),
+            session_id=unified_origin,
+            message_id=message_id,
+            review_status=decision.status,
+        )
 
     async def _extract_image_paths(self, event) -> list[Path]:
         message_obj = getattr(event, "message_obj", None)

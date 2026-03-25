@@ -90,6 +90,8 @@ PJSK 图片图库插件。
 - 投稿主 tag 不存在时，会自动创建并按角色 tag 处理
 - 可在投稿时通过 `别名:` / `alias` 一次性补充多个别名，多个别名建议用逗号分隔
 - 投稿图片会复用现有导入、去重、审核、入库流程
+- 投稿成功后的“已收录 / 等待审核”回执会直接发在当前对话里
+- 同时可额外把“收到新投稿 #review_id”通知发给 AstrBot 管理员或指定白名单
 
 ### 管理命令
 
@@ -130,6 +132,12 @@ PJSK 图片图库插件。
   - 独立 WebUI 监听端口
 - `webui_access_token`
   - 独立 WebUI 可选访问令牌
+- `submission_notify_enabled`
+  - 是否启用投稿后的管理员/白名单通知
+- `submission_notify_use_astr_admins`
+  - 是否默认通知 AstrBot 全局 `admins_id`
+- `submission_notify_targets`
+  - 额外通知目标；支持逗号/分号/换行分隔的用户 ID，或直接填写 unified_msg_origin
 - `crawler_max_candidates`
   - 每个采集任务最多解析 / 下载的候选图数量
 - `platform_request_timeout`
@@ -207,12 +215,22 @@ PJSK 图片图库插件。
 4. 支持多图投稿与频率限制
 5. 清理未真正落地的预留配置项
 6. 为采集适配器补测试样本
+7. 给投稿通知增加更细的模板与分平台目标管理
 
 ## 8. 当前版本
 
-- 当前插件版本：`0.5.4`
+- 当前插件版本：`0.5.5`
 
 ## 9. 更新记录
+
+### v0.5.5
+
+投稿通知版：
+
+- 保持投稿成功后的回执继续直接发在当前会话里
+- 新增“收到新投稿 #编号”主动通知，可默认发给 AstrBot 全局管理员
+- 新增 `submission_notify_enabled`、`submission_notify_use_astr_admins`、`submission_notify_targets` 配置项
+- 支持把额外白名单目标写成用户 ID 或 unified_msg_origin
 
 ### v0.5.4
 

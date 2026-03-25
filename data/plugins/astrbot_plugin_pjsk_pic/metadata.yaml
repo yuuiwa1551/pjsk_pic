@@ -1,7 +1,7 @@
 name: astrbot_plugin_pjsk_pic
 display_name: PJSK 图片库
 desc: 支持本地图库发图、多平台采集、自动审核与 WebUI 管理的 PJSK 图片库插件
-version: 0.5.4
+version: 0.5.5
 author: OpenAI
 repo: https://github.com/yuuiwa1551/pjsk_pic.git
 astrbot_version: ">=4.18.0"

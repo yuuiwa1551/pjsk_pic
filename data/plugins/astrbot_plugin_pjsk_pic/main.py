@@ -16,6 +16,7 @@ from .core import (
     ImportedImageService,
     LibraryIndexer,
     ReviewService,
+    SubmissionNotifyService,
     SubmissionService,
     extract_query_from_text,
 )
@@ -44,6 +45,7 @@ class PJSKPicPlugin(Star):
             config=config,
         )
         self.submission_service = SubmissionService(self.db, self.importer, self.reviewer)
+        self.submission_notify_service = SubmissionNotifyService(context, config)
         self.webui = GalleryWebUI(self.db, self.crawl_service)
         self.recent_by_session: dict[str, deque[int]] = defaultdict(
             lambda: deque(maxlen=self._dedupe_count()),
@@ -195,10 +197,6 @@ class PJSKPicPlugin(Star):
             if fallback and fallback.tag_name:
                 return fallback
         return None
-        fallback = self.submission_service.parse_submission_text(f"\u6295\u7A3F {body}")
-        if fallback and fallback.tag_name:
-            return fallback
-        return None
 
     async def _handle_submission_event(self, event: AstrMessageEvent, *, missing_tag_reply: str | None = None) -> bool:
         request = self._parse_submission_request(event.message_str)
@@ -207,15 +205,17 @@ class PJSKPicPlugin(Star):
                 await event.send(MessageChain().message(missing_tag_reply))
                 event.stop_event()
             return False
-        ok, message = await self.submission_service.submit_from_event(
+        result = await self.submission_service.submit_from_event(
             event,
             request.tag_name,
             aliases=request.aliases,
         )
-        if message:
-            await event.send(MessageChain().message(message))
+        if result.reply_message:
+            await event.send(MessageChain().message(result.reply_message))
+        if result.ok:
+            await self.submission_notify_service.notify(event, result)
         event.stop_event()
-        return bool(ok)
+        return bool(result.ok)
 
     @filter.command("\u6295\u7A3F", alias={"tg"})
     async def submit_image_by_user_command(self, event: AstrMessageEvent):
