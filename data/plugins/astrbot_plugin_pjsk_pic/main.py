@@ -24,6 +24,8 @@ from .core.webui import GalleryWebUI
 
 
 class PJSKPicPlugin(Star):
+    OPEN_REVIEW_STATUSES = ("pending", "uncertain", "rejected")
+
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
         self.config = config
@@ -100,6 +102,20 @@ class PJSKPicPlugin(Star):
 
     def _webui_access_token(self) -> str:
         return str(self.config.get("webui_access_token", "") or "").strip()
+
+    def _submission_review_enabled(self) -> bool:
+        return bool(self.config.get("submission_review_enabled", True))
+
+    def _set_submission_review_enabled(self, enabled: bool) -> tuple[bool, str]:
+        self.config["submission_review_enabled"] = bool(enabled)
+        save_config = getattr(self.config, "save_config", None)
+        if callable(save_config):
+            try:
+                save_config()
+            except Exception as exc:
+                logger.error(f"[PJSKPic] 保存投稿审核配置失败: {exc}", exc_info=True)
+                return False, f"保存投稿审核配置失败：{exc}"
+        return True, ""
 
     def _recent_queue(self, session_id: str) -> deque[int]:
         key = session_id or "default"
@@ -209,6 +225,7 @@ class PJSKPicPlugin(Star):
             event,
             request.tag_name,
             aliases=request.aliases,
+            review_enabled=self._submission_review_enabled(),
         )
         if result.reply_message:
             await event.send(MessageChain().message(result.reply_message))
@@ -356,12 +373,14 @@ class PJSKPicPlugin(Star):
     @pjsk_gallery.command("审核列表")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def list_review_tasks(self, event: AstrMessageEvent, status: str = ""):
-        wanted = str(status or "").strip() or None
-        rows = self.db.list_review_tasks(status=wanted, limit=10)
+        status_text = str(status or "").strip().lower()
+        statuses = list(self.OPEN_REVIEW_STATUSES) if not status_text else None
+        wanted = None if not status_text or status_text in {"all", "全部"} else status_text
+        rows = self.db.list_review_tasks(status=wanted, statuses=statuses, limit=10)
         if not rows:
             yield event.plain_result("当前没有审核任务。")
             return
-        lines = ["最近审核任务："]
+        lines = ["当前待处理审核任务：" if statuses else "最近审核任务："]
         for row in rows:
             lines.append(
                 f"#{row['id']} [{row['status']}] tag={row['tag_name']} image={row['image_id']}\n"
@@ -369,6 +388,32 @@ class PJSKPicPlugin(Star):
                 f"文件: {row['file_path']}"
             )
         yield event.plain_result("\n\n".join(lines))
+
+    @pjsk_gallery.command("审核查看")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def show_review_task(self, event: AstrMessageEvent, review_id: int = 0):
+        task = self.db.get_review_task(int(review_id)) if int(review_id or 0) > 0 else None
+        if task is None:
+            rows = self.db.list_review_tasks(statuses=self.OPEN_REVIEW_STATUSES, limit=1)
+            task = rows[0] if rows else None
+        if task is None:
+            yield event.plain_result("当前没有待处理审核图片。")
+            return
+
+        image_path = self.db.get_image_file_path(int(task["image_id"])) or str(task["file_path"] or "")
+        if image_path and Path(image_path).exists():
+            await event.send(MessageChain().file_image(str(image_path)))
+
+        yield event.plain_result(
+            f"审核任务 #{task['id']}\n"
+            f"状态：{task['status']}\n"
+            f"tag：{task['tag_name']}\n"
+            f"image_id：{task['image_id']}\n"
+            f"来源：{task['source_type'] or '-'}\n"
+            f"原因：{task['reason'] or '-'}\n"
+            f"通过：/pjsk图库 审核通过 {task['id']}\n"
+            f"拒绝：/pjsk图库 审核拒绝 {task['id']}"
+        )
 
     @pjsk_gallery.command("审核通过")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -381,6 +426,33 @@ class PJSKPicPlugin(Star):
     async def reject_review_task(self, event: AstrMessageEvent, review_id: int):
         ok, message = self.db.apply_manual_review(int(review_id), approved=False)
         yield event.plain_result(message if ok else f"处理失败：{message}")
+
+    @pjsk_gallery.command("投稿审核状态")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def submission_review_status(self, event: AstrMessageEvent):
+        enabled = self._submission_review_enabled()
+        yield event.plain_result(
+            "投稿审核当前状态："
+            + ("开启\n新投稿会进入审核链路。" if enabled else "关闭\n新投稿会默认直接入库并可参与发图。")
+        )
+
+    @pjsk_gallery.command("投稿审核开启")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def enable_submission_review(self, event: AstrMessageEvent):
+        ok, message = self._set_submission_review_enabled(True)
+        if not ok:
+            yield event.plain_result(message)
+            return
+        yield event.plain_result("投稿审核已开启；后续新投稿会进入审核链路。")
+
+    @pjsk_gallery.command("投稿审核关闭")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def disable_submission_review(self, event: AstrMessageEvent):
+        ok, message = self._set_submission_review_enabled(False)
+        if not ok:
+            yield event.plain_result(message)
+            return
+        yield event.plain_result("投稿审核已关闭；后续新投稿将默认直接入库并可参与发图。")
 
     @pjsk_gallery.command("面板地址")
     @filter.permission_type(filter.PermissionType.ADMIN)

@@ -790,7 +790,13 @@ class ImageIndexDB:
             )
             return int(cursor.lastrowid)
 
-    def list_review_tasks(self, *, status: str | None = None, limit: int = 20) -> list[sqlite3.Row]:
+    def list_review_tasks(
+        self,
+        *,
+        status: str | None = None,
+        statuses: Iterable[str] | None = None,
+        limit: int = 20,
+    ) -> list[sqlite3.Row]:
         sql = """
             SELECT rt.id, rt.status, rt.reason, rt.model_result, rt.manual_result,
                    rt.created_at, rt.updated_at,
@@ -803,7 +809,12 @@ class ImageIndexDB:
             LEFT JOIN image_tags it ON it.image_id = rt.image_id AND it.tag_id = rt.tag_id
         """
         params: list[Any] = []
-        if status:
+        normalized_statuses = [str(item).strip() for item in (statuses or []) if str(item).strip()]
+        if normalized_statuses:
+            placeholders = ",".join("?" for _ in normalized_statuses)
+            sql += f" WHERE rt.status IN ({placeholders})"
+            params.extend(normalized_statuses)
+        elif status:
             sql += ' WHERE rt.status = ?'
             params.append(status)
         sql += ' ORDER BY rt.id DESC LIMIT ?'

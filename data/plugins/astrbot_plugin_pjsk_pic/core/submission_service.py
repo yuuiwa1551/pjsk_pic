@@ -99,7 +99,14 @@ class SubmissionService:
             result.append(alias)
         return result
 
-    async def submit_from_event(self, event, tag_name: str, aliases: list[str] | None = None) -> SubmissionResult:
+    async def submit_from_event(
+        self,
+        event,
+        tag_name: str,
+        aliases: list[str] | None = None,
+        *,
+        review_enabled: bool = True,
+    ) -> SubmissionResult:
         clean_tag = str(tag_name or "").strip()
         if not clean_tag:
             return SubmissionResult(
@@ -139,25 +146,35 @@ class SubmissionService:
             else:
                 skipped_aliases.append(f"{alias}\uFF08{message}\uFF09")
 
-        decision = await self.reviewer.review_image_for_tag(imported.file_path, clean_tag)
+        if review_enabled:
+            decision = await self.reviewer.review_image_for_tag(imported.file_path, clean_tag)
+            review_status = decision.status
+            review_score = decision.confidence
+            review_reason = decision.reason
+            review_raw_result = decision.raw_result
+        else:
+            review_status = "approved"
+            review_score = 1.0
+            review_reason = "投稿审核已关闭，直接入库"
+            review_raw_result = ""
 
         self.db.link_image_tag(
             imported.image_id,
             tag_id,
             source_type="submission:user",
-            review_status=decision.status,
-            score=decision.confidence,
-            review_reason=decision.reason,
+            review_status=review_status,
+            score=review_score,
+            review_reason=review_reason,
         )
 
         review_id: int | None = None
-        if decision.status in {"pending", "uncertain", "rejected"} or self.reviewer.is_character_tag(clean_tag):
+        if review_enabled and (review_status in {"pending", "uncertain", "rejected"} or self.reviewer.is_character_tag(clean_tag)):
             review_id = self.db.create_review_task(
                 imported.image_id,
                 tag_id,
-                decision.status,
-                model_result=decision.raw_result,
-                reason=decision.reason,
+                review_status,
+                model_result=review_raw_result,
+                reason=review_reason,
             )
 
         sender_id = self._safe_call(event, "get_sender_id")
@@ -200,12 +217,14 @@ class SubmissionService:
         if skipped_aliases:
             lines.append("\u4EE5\u4E0B\u522B\u540D\u672A\u5904\u7406\uFF1A" + "\uFF1B".join(skipped_aliases[:10]))
         lines.append(f"image_id\uFF1A{imported.image_id}")
-        if decision.status == "approved":
+        if not review_enabled:
+            lines.append("\u5BA1\u6838\u7ED3\u679C\uFF1A\u5DF2\u5173\u95ED\u6295\u7A3F\u5BA1\u6838\uFF0C\u672C\u6B21\u5DF2\u76F4\u63A5\u5165\u5E93\u5E76\u53EF\u53C2\u4E0E\u53D1\u56FE\u3002")
+        elif review_status == "approved":
             lines.append("\u5BA1\u6838\u7ED3\u679C\uFF1A\u5DF2\u901A\u8FC7\uFF0C\u53EF\u76F4\u63A5\u53C2\u4E0E\u53D1\u56FE\u3002")
-        elif decision.status in {"pending", "uncertain"}:
+        elif review_status in {"pending", "uncertain"}:
             lines.append(f"\u5BA1\u6838\u7ED3\u679C\uFF1A\u5F85\u4EBA\u5DE5\u590D\u6838\uFF08review_id\uFF1A{review_id or '-'}\uFF09\u3002")
         else:
-            lines.append(f"\u5BA1\u6838\u7ED3\u679C\uFF1A{decision.status}\uFF08review_id\uFF1A{review_id or '-'}\uFF09\u3002")
+            lines.append(f"\u5BA1\u6838\u7ED3\u679C\uFF1A{review_status}\uFF08review_id\uFF1A{review_id or '-'}\uFF09\u3002")
 
         if imported.similar_image_ids:
             lines.append("\u68C0\u6D4B\u5230\u7591\u4F3C\u91CD\u590D\u56FE\u7247\uFF1A" + "\u3001".join(str(item) for item in imported.similar_image_ids[:10]))
@@ -221,7 +240,7 @@ class SubmissionService:
             platform_name=str(platform_name or ""),
             session_id=unified_origin,
             message_id=message_id,
-            review_status=decision.status,
+            review_status=review_status,
         )
 
     async def _extract_image_paths(self, event) -> list[Path]:
