@@ -506,20 +506,36 @@ class ImageIndexDB:
         tag_name = tag_name.strip()
         alias = alias.strip()
         if not tag_name or not alias:
-            return False, 'tag 和 alias 都不能为空。'
+            return False, 'tag \u548c alias \u90FD\u4E0D\u80FD\u4E3A\u7A7A\u3002'
         tag_id = self.get_tag_id(tag_name)
         if tag_id is None:
-            return False, f'tag 不存在：{tag_name}'
+            return False, f'tag \u4E0D\u5B58\u5728\uFF1A{tag_name}'
+        normalized_tag = normalize_tag_name(tag_name)
         normalized = normalize_tag_name(alias)
+        if normalized == normalized_tag:
+            return False, f'alias \u4E0D\u80FD\u4E0E\u4E3B tag \u76F8\u540C\uFF1A{alias}'
         with self._lock, self._connect() as conn:
-            exists = conn.execute('SELECT id FROM tag_aliases WHERE normalized_alias = ?', (normalized,)).fetchone()
+            conflict_tag = conn.execute(
+                'SELECT id, name FROM tags WHERE normalized_name = ? LIMIT 1',
+                (normalized,),
+            ).fetchone()
+            if conflict_tag:
+                if int(conflict_tag['id']) == tag_id:
+                    return False, f'alias \u4E0D\u80FD\u4E0E\u4E3B tag \u76F8\u540C\uFF1A{alias}'
+                return False, f'alias \u4E0E\u73B0\u6709 tag \u51B2\u7A81\uFF1A{conflict_tag["name"]}'
+            exists = conn.execute(
+                "SELECT a.tag_id, t.name FROM tag_aliases a JOIN tags t ON t.id = a.tag_id WHERE a.normalized_alias = ? LIMIT 1",
+                (normalized,),
+            ).fetchone()
             if exists:
-                return False, f'alias 已存在：{alias}'
+                if int(exists['tag_id']) == tag_id:
+                    return False, f'alias \u5DF2\u5B58\u5728\uFF1A{alias}'
+                return False, f'alias \u5DF2\u88AB {exists["name"]} \u4F7F\u7528\uFF1A{alias}'
             conn.execute(
                 'INSERT INTO tag_aliases(tag_id, alias, normalized_alias, created_at) VALUES(?, ?, ?, ?)',
                 (tag_id, alias, normalized, utcnow_str()),
             )
-        return True, f'已添加别名：{tag_name} -> {alias}'
+        return True, f'\u5DF2\u6DFB\u52A0\u522B\u540D\uFF1A{tag_name} -> {alias}'
 
     def remove_alias(self, tag_name: str, alias: str) -> tuple[bool, str]:
         tag_id = self.get_tag_id(tag_name.strip())

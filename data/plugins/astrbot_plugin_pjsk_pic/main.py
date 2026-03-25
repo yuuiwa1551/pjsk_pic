@@ -178,12 +178,16 @@ class PJSKPicPlugin(Star):
         await self._send_tag_image(event, query, silent_on_tool=True)
         event.stop_event()
 
-    @filter.regex(r"(?:^|[\s])(?:[/!！.。．])?(?:投稿|tg)\s+.+")
+    @filter.regex("(?:^|[\\s])(?:[/!\uFF01.\u3002\uFF0E])?(?:\u6295\u7A3F|tg)\\s+.+")
     async def submit_image_by_user(self, event: AstrMessageEvent):
-        tag_name = self.submission_service.extract_tag_from_text(event.message_str)
-        if not tag_name:
+        request = self.submission_service.parse_submission_text(event.message_str)
+        if not request or not request.tag_name:
             return
-        ok, message = await self.submission_service.submit_from_event(event, tag_name)
+        ok, message = await self.submission_service.submit_from_event(
+            event,
+            request.tag_name,
+            aliases=request.aliases,
+        )
         if message:
             await event.send(MessageChain().message(message))
         event.stop_event()
