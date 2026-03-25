@@ -47,7 +47,7 @@
   "webui_port": {
     "type": "int",
     "description": "独立 WebUI 监听端口。",
-    "default": 6199
+    "default": 9099
   },
   "webui_access_token": {
     "type": "string",

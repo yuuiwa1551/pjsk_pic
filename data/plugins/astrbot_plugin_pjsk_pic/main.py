@@ -97,7 +97,7 @@ class PJSKPicPlugin(Star):
         return str(self.config.get("webui_host", "0.0.0.0") or "0.0.0.0").strip() or "0.0.0.0"
 
     def _webui_port(self) -> int:
-        value = int(self.config.get("webui_port", 6199) or 6199)
+        value = int(self.config.get("webui_port", 9099) or 9099)
         return min(max(1, value), 65535)
 
     def _webui_access_token(self) -> str:
