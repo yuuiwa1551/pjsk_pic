@@ -273,7 +273,7 @@ Pixiv ??????????
 
 ## 9. ????
 
-### v0.9.7
+### v0.9.8
 
 - 修复 WebUI access token 判断失效的问题
 - 现在未带 token 访问 WebUI API 会正确返回 403

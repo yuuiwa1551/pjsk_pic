@@ -11,6 +11,15 @@ from .matcher import normalize_tag_name
 from .models import APPROVED_STATUSES, MatchResult
 from .phash import hamming_distance
 
+IMAGE_TAG_STATUS_PRIORITY = {
+    "manual_approved": 5,
+    "approved": 4,
+    "pending": 3,
+    "uncertain": 2,
+    "manual_rejected": 1,
+    "rejected": 0,
+}
+
 
 def utcnow_str() -> str:
     return datetime.utcnow().isoformat(timespec="seconds")
@@ -340,6 +349,33 @@ class ImageIndexDB:
             (now, image_id),
         )
 
+    def _set_preferred_image_variant(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        image_id: int,
+        file_path: str,
+        file_name: str,
+        sha256: str,
+        phash: str,
+        width: int,
+        height: int,
+        format_: str,
+        now: str,
+    ) -> None:
+        conn.execute(
+            "UPDATE image_files SET is_active = CASE WHEN file_path = ? THEN 1 ELSE 0 END, updated_at = ? WHERE image_id = ?",
+            (file_path, now, image_id),
+        )
+        conn.execute(
+            """
+            UPDATE images
+            SET file_path = ?, file_name = ?, sha256 = ?, phash = ?, width = ?, height = ?, format = ?, is_active = 1, updated_at = ?
+            WHERE id = ?
+            """,
+            (file_path, file_name, sha256, phash, width, height, format_, now, image_id),
+        )
+
     def upsert_image(
         self,
         *,
@@ -446,7 +482,7 @@ class ImageIndexDB:
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT id, file_path, phash
+                SELECT id, file_path, file_name, sha256, phash, width, height, format, updated_at
                 FROM images
                 WHERE is_active = 1 AND phash != ''
                 ORDER BY id DESC
@@ -460,6 +496,235 @@ class ImageIndexDB:
                 matches.append((distance, row))
         matches.sort(key=lambda item: (item[0], -int(item[1]["id"])))
         return [row for _, row in matches[:limit]]
+
+    def get_image_row(self, image_id: int) -> sqlite3.Row | None:
+        with self._lock, self._connect() as conn:
+            return conn.execute("SELECT * FROM images WHERE id = ? LIMIT 1", (image_id,)).fetchone()
+
+    def attach_image_variant(
+        self,
+        image_id: int,
+        *,
+        file_path: str,
+        file_name: str,
+        sha256: str,
+        phash: str,
+        width: int,
+        height: int,
+        format_: str,
+        storage_type: str = "imported",
+        make_primary: bool = False,
+    ) -> int:
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT id FROM images WHERE id = ? LIMIT 1", (image_id,)).fetchone()
+            if not row:
+                raise ValueError(f"image not found: {image_id}")
+            self._upsert_file_location(
+                conn,
+                image_id=image_id,
+                file_path=file_path,
+                file_name=file_name,
+                storage_type=storage_type,
+                now=now,
+            )
+            if make_primary:
+                self._set_preferred_image_variant(
+                    conn,
+                    image_id=image_id,
+                    file_path=file_path,
+                    file_name=file_name,
+                    sha256=sha256,
+                    phash=phash,
+                    width=width,
+                    height=height,
+                    format_=format_,
+                    now=now,
+                )
+            else:
+                conn.execute(
+                    "UPDATE image_files SET is_active = 0, updated_at = ? WHERE image_id = ? AND file_path = ?",
+                    (now, image_id, file_path),
+                )
+                self._sync_image_file_state(conn, image_id, now=now)
+        return image_id
+
+    @staticmethod
+    def _preferred_image_tag_status(*statuses: str) -> str:
+        valid = [str(item or "").strip() for item in statuses if str(item or "").strip()]
+        if not valid:
+            return "approved"
+        return max(valid, key=lambda item: (IMAGE_TAG_STATUS_PRIORITY.get(item, -1), item))
+
+    def merge_images(
+        self,
+        primary_image_id: int,
+        duplicate_image_id: int,
+        *,
+        preferred_file_path: str | None = None,
+        preferred_file_name: str | None = None,
+        preferred_sha256: str | None = None,
+        preferred_phash: str | None = None,
+        preferred_width: int | None = None,
+        preferred_height: int | None = None,
+        preferred_format: str | None = None,
+    ) -> tuple[bool, str]:
+        if primary_image_id == duplicate_image_id:
+            return False, "cannot merge the same image"
+
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            primary = conn.execute("SELECT * FROM images WHERE id = ? LIMIT 1", (primary_image_id,)).fetchone()
+            duplicate = conn.execute("SELECT * FROM images WHERE id = ? LIMIT 1", (duplicate_image_id,)).fetchone()
+            if not primary or not duplicate:
+                return False, "image_not_found"
+
+            conn.execute(
+                "UPDATE image_files SET image_id = ?, updated_at = ? WHERE image_id = ?",
+                (primary_image_id, now, duplicate_image_id),
+            )
+
+            duplicate_tags = conn.execute(
+                """
+                SELECT tag_id, source_type, score, review_status, review_reason, created_at
+                FROM image_tags
+                WHERE image_id = ?
+                """,
+                (duplicate_image_id,),
+            ).fetchall()
+            for row in duplicate_tags:
+                existing = conn.execute(
+                    """
+                    SELECT id, score, review_status, review_reason, created_at
+                    FROM image_tags
+                    WHERE image_id = ? AND tag_id = ? AND source_type = ?
+                    LIMIT 1
+                    """,
+                    (primary_image_id, int(row["tag_id"]), str(row["source_type"])),
+                ).fetchone()
+                merged_status = self._preferred_image_tag_status(
+                    str(row["review_status"] or ""),
+                    str(existing["review_status"] or "") if existing else "",
+                )
+                merged_score = max(
+                    float(row["score"] or 0.0),
+                    float(existing["score"] or 0.0) if existing else 0.0,
+                )
+                merged_reason = (
+                    str(existing["review_reason"] or "") if existing and str(existing["review_reason"] or "").strip()
+                    else str(row["review_reason"] or "")
+                )
+                if existing:
+                    conn.execute(
+                        """
+                        UPDATE image_tags
+                        SET score = ?, review_status = ?, review_reason = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (merged_score, merged_status, merged_reason, now, int(existing["id"])),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO image_tags(image_id, tag_id, source_type, score, review_status, review_reason, created_at, updated_at)
+                        VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            primary_image_id,
+                            int(row["tag_id"]),
+                            str(row["source_type"]),
+                            merged_score,
+                            merged_status,
+                            merged_reason,
+                            str(row["created_at"] or now),
+                            now,
+                        ),
+                    )
+            conn.execute("DELETE FROM image_tags WHERE image_id = ?", (duplicate_image_id,))
+
+            duplicate_sources = conn.execute("SELECT * FROM sources WHERE image_id = ?", (duplicate_image_id,)).fetchall()
+            for row in duplicate_sources:
+                existing = conn.execute(
+                    "SELECT id FROM sources WHERE image_id = ? AND image_url = ? LIMIT 1",
+                    (primary_image_id, str(row["image_url"])),
+                ).fetchone()
+                if existing:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO sources(image_id, platform, post_url, image_url, author, raw_tags, extra_json, created_at)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        primary_image_id,
+                        str(row["platform"]),
+                        str(row["post_url"]),
+                        str(row["image_url"]),
+                        str(row["author"] or ""),
+                        str(row["raw_tags"] or "[]"),
+                        str(row["extra_json"] or "{}"),
+                        str(row["created_at"] or now),
+                    ),
+                )
+            conn.execute("DELETE FROM sources WHERE image_id = ?", (duplicate_image_id,))
+
+            duplicate_reviews = conn.execute("SELECT * FROM review_tasks WHERE image_id = ?", (duplicate_image_id,)).fetchall()
+            for row in duplicate_reviews:
+                existing = conn.execute(
+                    "SELECT id FROM review_tasks WHERE image_id = ? AND tag_id = ? LIMIT 1",
+                    (primary_image_id, int(row["tag_id"])),
+                ).fetchone()
+                if existing:
+                    conn.execute("DELETE FROM review_tasks WHERE id = ?", (int(row["id"]),))
+                else:
+                    conn.execute(
+                        "UPDATE review_tasks SET image_id = ?, updated_at = ? WHERE id = ?",
+                        (primary_image_id, now, int(row["id"])),
+                    )
+
+            conn.execute("UPDATE send_logs SET image_id = ? WHERE image_id = ?", (primary_image_id, duplicate_image_id))
+
+            preferred_path = str(preferred_file_path or "").strip() or str(primary["file_path"])
+            preferred_name = str(preferred_file_name or "").strip() or str(primary["file_name"])
+            preferred_sha = str(preferred_sha256 or "").strip() or str(primary["sha256"])
+            preferred_ph = str(preferred_phash or "").strip() or str(primary["phash"] or "")
+            width = int(preferred_width if preferred_width is not None else int(primary["width"] or 0))
+            height = int(preferred_height if preferred_height is not None else int(primary["height"] or 0))
+            format_name = str(preferred_format or "").strip() or str(primary["format"] or "")
+
+            duplicate_current_path = str(duplicate["file_path"] or "").strip()
+            if preferred_path and preferred_path == duplicate_current_path and preferred_path != str(primary["file_path"] or ""):
+                placeholder_path = f"{preferred_path}#merged-{duplicate_image_id}"
+                conn.execute(
+                    "UPDATE images SET file_path = ?, updated_at = ? WHERE id = ?",
+                    (placeholder_path, now, duplicate_image_id),
+                )
+
+            self._set_preferred_image_variant(
+                conn,
+                image_id=primary_image_id,
+                file_path=preferred_path,
+                file_name=preferred_name,
+                sha256=preferred_sha,
+                phash=preferred_ph,
+                width=width,
+                height=height,
+                format_=format_name,
+                now=now,
+            )
+            conn.execute(
+                "UPDATE image_files SET is_active = 0, updated_at = ? WHERE image_id = ? AND file_path != ?",
+                (now, primary_image_id, preferred_path),
+            )
+            conn.execute(
+                """
+                UPDATE images
+                SET is_active = 0, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, duplicate_image_id),
+            )
+        return True, f"merged {duplicate_image_id} -> {primary_image_id}"
 
     def mark_missing_files_inactive(self, library_root: str, seen_paths: set[str]) -> int:
         root = str(Path(library_root).resolve())

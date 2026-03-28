@@ -169,6 +169,41 @@ class PJSKPicPlugin(Star):
             lines.append(f"查看详情：/pjsk图库 审核查看 {review_id}")
         await event.send(MessageChain().message("\n\n".join(lines)))
 
+    async def _send_review_task_detail(self, event: AstrMessageEvent, task) -> None:
+        image_path = self._review_image_path(int(task["image_id"]), str(task["file_path"] or ""))
+        if image_path:
+            await event.send(MessageChain().file_image(str(image_path)))
+        await event.send(
+            MessageChain().message(
+                f"审核任务 #{task['id']}\n"
+                f"状态：{task['status']}\n"
+                f"tag：{task['tag_name']}\n"
+                f"image_id：{task['image_id']}\n"
+                f"来源：{task['source_type'] or '-'}\n"
+                f"原因：{task['reason'] or '-'}\n"
+                f"通过：/pjsk图库 审核通过 {task['id']}\n"
+                f"拒绝：/pjsk图库 审核拒绝 {task['id']}"
+            ),
+        )
+
+    async def _send_next_open_review_task(
+        self,
+        event: AstrMessageEvent,
+        *,
+        exclude_review_ids: set[int] | None = None,
+    ) -> bool:
+        excluded = {int(item) for item in (exclude_review_ids or set()) if int(item) > 0}
+        rows = self.db.list_review_tasks(statuses=self.OPEN_REVIEW_STATUSES, limit=20)
+        for row in rows:
+            review_id = int(row["id"])
+            if review_id in excluded:
+                continue
+            await event.send(MessageChain().message("下一张待审核图片："))
+            await self._send_review_task_detail(event, row)
+            return True
+        await event.send(MessageChain().message("当前没有更多待审核图片。"))
+        return False
+
     def _resolve_existing_tag_name(self, raw_query: str, *, allow_fuzzy: bool = False) -> tuple[str | None, str]:
         query = str(raw_query or "").strip()
         if not query:
@@ -939,33 +974,27 @@ class PJSKPicPlugin(Star):
         if task is None:
             yield event.plain_result("当前没有待处理审核图片。")
             return
-
-        image_path = self._review_image_path(int(task["image_id"]), str(task["file_path"] or ""))
-        if image_path:
-            await event.send(MessageChain().file_image(str(image_path)))
-
-        yield event.plain_result(
-            f"审核任务 #{task['id']}\n"
-            f"状态：{task['status']}\n"
-            f"tag：{task['tag_name']}\n"
-            f"image_id：{task['image_id']}\n"
-            f"来源：{task['source_type'] or '-'}\n"
-            f"原因：{task['reason'] or '-'}\n"
-            f"通过：/pjsk图库 审核通过 {task['id']}\n"
-            f"拒绝：/pjsk图库 审核拒绝 {task['id']}"
-        )
+        await self._send_review_task_detail(event, task)
 
     @pjsk_gallery.command("审核通过")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def approve_review_task(self, event: AstrMessageEvent, review_id: int):
         ok, message = self.db.apply_manual_review(int(review_id), approved=True)
-        yield event.plain_result(message if ok else f"处理失败：{message}")
+        if ok:
+            await event.send(MessageChain().message(message))
+            await self._send_next_open_review_task(event, exclude_review_ids={int(review_id)})
+            return
+        yield event.plain_result(f"处理失败：{message}")
 
     @pjsk_gallery.command("审核拒绝")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def reject_review_task(self, event: AstrMessageEvent, review_id: int):
         ok, message = self.db.apply_manual_review(int(review_id), approved=False)
-        yield event.plain_result(message if ok else f"处理失败：{message}")
+        if ok:
+            await event.send(MessageChain().message(message))
+            await self._send_next_open_review_task(event, exclude_review_ids={int(review_id)})
+            return
+        yield event.plain_result(f"处理失败：{message}")
 
     @pjsk_gallery.command("投稿审核状态")
     @filter.permission_type(filter.PermissionType.ADMIN)

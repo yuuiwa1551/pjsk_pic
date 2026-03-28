@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from difflib import SequenceMatcher
 from typing import Iterable
 
 from astrbot.api import logger
@@ -194,7 +195,11 @@ class CrawlService:
                     },
                 )
 
-                tags = self.tag_cleaner.clean_tags(self._merge_tags(manual_tags, candidate.raw_tags), platform=platform)
+                tags = self.tag_cleaner.clean_tags(
+                    self._merge_tags(manual_tags, [*candidate.raw_tags, *translated_tags]),
+                    platform=platform,
+                )
+                tags = self._collapse_similar_tags(tags, preferred_tags=[*manual_tags, *include_tags])
                 if not tags:
                     skipped_without_tags += 1
                     continue
@@ -289,6 +294,63 @@ class CrawlService:
     def _normalized_rule_tags(self, tags: Iterable[str]) -> set[str]:
         normalized = self.tag_cleaner.normalize_tags(list(tags), drop_noise=False)
         return {normalize_tag_name(tag) for tag in normalized if tag}
+
+    @classmethod
+    def _collapse_similar_tags(cls, tags: list[str], *, preferred_tags: Iterable[str]) -> list[str]:
+        if not tags:
+            return []
+
+        normalized_preferred: list[str] = []
+        seen_preferred: set[str] = set()
+        for tag in preferred_tags:
+            normalized = normalize_tag_name(str(tag))
+            if not normalized or normalized in seen_preferred:
+                continue
+            seen_preferred.add(normalized)
+            normalized_preferred.append(normalized)
+        if not normalized_preferred:
+            return tags
+
+        consumed_indexes: set[int] = set()
+        chosen_indexes: set[int] = set()
+        for target in normalized_preferred:
+            matches: list[tuple[float, int]] = []
+            for index, tag in enumerate(tags):
+                score = cls._tag_similarity_score(tag, target)
+                if score < 0.72:
+                    continue
+                matches.append((score, index))
+            if len(matches) <= 1:
+                continue
+            matches.sort(key=lambda item: (-item[0], item[1]))
+            winner = matches[0][1]
+            chosen_indexes.add(winner)
+            for _, index in matches:
+                consumed_indexes.add(index)
+
+        if not consumed_indexes:
+            return tags
+
+        result: list[str] = []
+        for index, tag in enumerate(tags):
+            if index in consumed_indexes and index not in chosen_indexes:
+                continue
+            result.append(tag)
+        return result
+
+    @staticmethod
+    def _tag_similarity_score(left: str, right: str) -> float:
+        normalized_left = normalize_tag_name(str(left))
+        normalized_right = normalize_tag_name(str(right))
+        if not normalized_left or not normalized_right:
+            return 0.0
+        if normalized_left == normalized_right:
+            return 1.0
+        shorter = min(len(normalized_left), len(normalized_right))
+        longer = max(len(normalized_left), len(normalized_right))
+        if normalized_left in normalized_right or normalized_right in normalized_left:
+            return 0.88 + (shorter / max(1, longer)) * 0.12
+        return SequenceMatcher(None, normalized_left, normalized_right).ratio()
 
     @staticmethod
     def _match_filter_reason(

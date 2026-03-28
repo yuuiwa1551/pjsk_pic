@@ -14,7 +14,7 @@ from PIL import Image
 
 from .db import ImageIndexDB
 from .models import CrawlCandidate, ImportedImage
-from .phash import compute_image_phash
+from .phash import compute_image_phash, hamming_distance
 
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -32,6 +32,15 @@ FORMAT_EXTENSIONS = {
     "webp": ".webp",
     "gif": ".gif",
     "bmp": ".bmp",
+}
+
+FORMAT_QUALITY_RANK = {
+    "png": 4,
+    "webp": 3,
+    "jpeg": 2,
+    "jpg": 2,
+    "bmp": 1,
+    "gif": 0,
 }
 
 
@@ -121,10 +130,67 @@ class ImportedImageService:
         width, height, format_name = self._read_image_meta(body)
         phash = compute_image_phash(body) if self.enable_phash_dedupe else ""
         similar_rows = self.db.find_similar_images_by_phash(phash, max_distance=self.phash_max_distance) if phash else []
+        duplicate_target = self._pick_duplicate_target(
+            similar_rows,
+            phash=phash,
+            width=width,
+            height=height,
+        )
         extension = self._guess_extension(source_name, content_type, format_name)
         file_dir = self.import_root / platform / sha256[:2]
         file_dir.mkdir(parents=True, exist_ok=True)
         file_path = file_dir / f"{sha256}{extension}"
+        candidate_quality = self._quality_key(width=width, height=height, body_size=len(body), format_name=format_name)
+
+        if duplicate_target is not None:
+            target_id = int(duplicate_target["id"])
+            existing_quality = self._quality_key(
+                width=int(duplicate_target["width"] or 0),
+                height=int(duplicate_target["height"] or 0),
+                body_size=0,
+                format_name=str(duplicate_target["format"] or ""),
+            )
+            if candidate_quality > existing_quality:
+                if not file_path.exists():
+                    file_path.write_bytes(body)
+                image_id = self.db.attach_image_variant(
+                    target_id,
+                    file_path=str(file_path),
+                    file_name=file_path.name,
+                    sha256=sha256,
+                    phash=phash,
+                    width=width,
+                    height=height,
+                    format_=format_name,
+                    storage_type="imported",
+                    make_primary=True,
+                )
+                return ImportedImage(
+                    image_id=image_id,
+                    file_path=file_path,
+                    sha256=sha256,
+                    phash=phash,
+                    width=width,
+                    height=height,
+                    format=format_name,
+                    similar_image_ids=[int(row["id"]) for row in similar_rows if int(row["id"]) != image_id],
+                )
+
+            existing = self.db.get_image_row(target_id)
+            resolved_path = Path(self.db.get_image_file_path(target_id) or str(existing["file_path"] if existing else ""))
+            if not resolved_path.exists():
+                resolved_path = file_path
+            return ImportedImage(
+                image_id=target_id,
+                file_path=resolved_path,
+                sha256=str(existing["sha256"] or sha256) if existing else sha256,
+                phash=str(existing["phash"] or phash) if existing else phash,
+                width=int(existing["width"] or width) if existing else width,
+                height=int(existing["height"] or height) if existing else height,
+                format=str(existing["format"] or format_name) if existing else format_name,
+                similar_image_ids=[int(row["id"]) for row in similar_rows if int(row["id"]) != target_id],
+            )
+
         if not file_path.exists():
             file_path.write_bytes(body)
 
@@ -168,3 +234,54 @@ class ImportedImageService:
         if by_url:
             return by_url
         return ".bin"
+
+    @staticmethod
+    def _quality_key(*, width: int, height: int, body_size: int, format_name: str) -> tuple[int, int, int, int]:
+        area = max(0, int(width or 0)) * max(0, int(height or 0))
+        longest_edge = max(int(width or 0), int(height or 0))
+        format_rank = FORMAT_QUALITY_RANK.get(str(format_name or "").lower(), 0)
+        return (area, longest_edge, max(0, int(body_size or 0)), format_rank)
+
+    @staticmethod
+    def _roughly_same_aspect_ratio(width: int, height: int, other_width: int, other_height: int) -> bool:
+        if min(width, height, other_width, other_height) <= 0:
+            return False
+        ratio = width / height
+        other_ratio = other_width / other_height
+        return abs(ratio - other_ratio) <= 0.03
+
+    def _pick_duplicate_target(
+        self,
+        similar_rows,
+        *,
+        phash: str,
+        width: int,
+        height: int,
+    ):
+        if not phash:
+            return None
+        strict_distance = max(0, min(int(self.phash_max_distance or 0), 3))
+        best_row = None
+        best_key = None
+        for row in similar_rows:
+            other_phash = str(row["phash"] or "")
+            if not other_phash:
+                continue
+            distance = hamming_distance(phash, other_phash)
+            if distance > strict_distance:
+                continue
+            other_width = int(row["width"] or 0)
+            other_height = int(row["height"] or 0)
+            if not self._roughly_same_aspect_ratio(width, height, other_width, other_height):
+                continue
+            quality_key = self._quality_key(
+                width=other_width,
+                height=other_height,
+                body_size=0,
+                format_name=str(row["format"] or ""),
+            )
+            candidate_key = (distance, tuple(-value for value in quality_key), -int(row["id"]))
+            if best_key is None or candidate_key < best_key:
+                best_key = candidate_key
+                best_row = row
+        return best_row
