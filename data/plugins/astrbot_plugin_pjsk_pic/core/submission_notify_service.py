@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from astrbot.api import logger
 from astrbot.api.star import Context
 from astrbot.core.message.message_event_result import MessageChain
 
+from .db import ImageIndexDB
 from .submission_service import SubmissionResult
 
 
 class SubmissionNotifyService:
-    def __init__(self, context: Context, config) -> None:
+    def __init__(self, context: Context, db: ImageIndexDB, config) -> None:
         self.context = context
+        self.db = db
         self.config = config
 
     def is_enabled(self) -> bool:
@@ -73,6 +76,24 @@ class SubmissionNotifyService:
             resolved.append(target)
         return resolved
 
+    def preview_image_paths(self, result: SubmissionResult, *, limit: int = 3) -> list[Path]:
+        paths: list[Path] = []
+        seen: set[str] = set()
+        max_items = max(1, int(limit or 1))
+        for image_id in result.image_ids:
+            file_path = self.db.get_image_file_path(int(image_id))
+            if not file_path:
+                continue
+            path = Path(file_path)
+            normalized = str(path)
+            if not path.exists() or normalized in seen:
+                continue
+            seen.add(normalized)
+            paths.append(path)
+            if len(paths) >= max_items:
+                break
+        return paths
+
     @staticmethod
     def build_message(result: SubmissionResult) -> str:
         review_ids = result.review_ids
@@ -111,9 +132,12 @@ class SubmissionNotifyService:
             return 0
 
         text = self.build_message(result)
+        preview_paths = self.preview_image_paths(result)
         sent = 0
         for target in targets:
             try:
+                for image_path in preview_paths:
+                    await self.context.send_message(target, MessageChain().file_image(str(image_path)))
                 await self.context.send_message(target, MessageChain().message(text))
                 sent += 1
             except Exception as exc:

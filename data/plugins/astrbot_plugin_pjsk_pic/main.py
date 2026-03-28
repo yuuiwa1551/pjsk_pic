@@ -58,7 +58,7 @@ class PJSKPicPlugin(Star):
             config=config,
         )
         self.submission_service = SubmissionService(self.db, self.importer, self.reviewer)
-        self.submission_notify_service = SubmissionNotifyService(context, config)
+        self.submission_notify_service = SubmissionNotifyService(context, self.db, config)
         self.webui = GalleryWebUI(self.db, self.crawl_service)
         self.recent_by_session: dict[str, deque[int]] = defaultdict(
             lambda: deque(maxlen=self._dedupe_count()),
@@ -137,6 +137,37 @@ class PJSKPicPlugin(Star):
             queue = deque(list(queue or []), maxlen=self._dedupe_count())
             self.recent_by_session[key] = queue
         return queue
+
+    def _review_image_path(self, image_id: int, fallback_path: str = "") -> Path | None:
+        resolved_path = self.db.get_image_file_path(int(image_id)) or str(fallback_path or "")
+        if not resolved_path:
+            return None
+        path = Path(resolved_path)
+        if not path.exists():
+            return None
+        return path
+
+    async def _send_review_group_preview(self, event: AstrMessageEvent, rows: list[dict]) -> None:
+        if not rows:
+            return
+        first = rows[0]
+        image_id = int(first["image_id"])
+        image_path = self._review_image_path(image_id, str(first.get("file_path", "") or ""))
+        if image_path:
+            await event.send(MessageChain().file_image(str(image_path)))
+
+        header = f"图片 #{image_id} 的审核任务（{len(rows)} 条）"
+        lines = [header]
+        for row in rows:
+            lines.append(
+                f"#{row['id']} [{row['status']}] tag={row['tag_name']}\n"
+                f"来源：{row.get('source_type') or '-'}\n"
+                f"原因：{row.get('reason') or '-'}"
+            )
+        if rows:
+            review_id = int(rows[0]["id"])
+            lines.append(f"查看详情：/pjsk图库 审核查看 {review_id}")
+        await event.send(MessageChain().message("\n\n".join(lines)))
 
     def _resolve_existing_tag_name(self, raw_query: str, *, allow_fuzzy: bool = False) -> tuple[str | None, str]:
         query = str(raw_query or "").strip()
@@ -866,14 +897,37 @@ class PJSKPicPlugin(Star):
         if not rows:
             yield event.plain_result("当前没有审核任务。")
             return
-        lines = ["当前待处理审核任务：" if statuses else "最近审核任务："]
+        grouped: dict[int, list[dict]] = {}
+        ordered_image_ids: list[int] = []
         for row in rows:
-            lines.append(
-                f"#{row['id']} [{row['status']}] tag={row['tag_name']} image={row['image_id']}\n"
-                f"原因: {row['reason'] or '-'}\n"
-                f"文件: {row['file_path']}"
+            item = dict(row)
+            image_id = int(item["image_id"])
+            if image_id not in grouped:
+                grouped[image_id] = []
+                ordered_image_ids.append(image_id)
+            grouped[image_id].append(item)
+
+        await event.send(
+            MessageChain().message(
+                (
+                    "当前待处理审核任务："
+                    if statuses
+                    else "最近审核任务："
+                )
+                + f"{len(rows)} 条，涉及 {len(ordered_image_ids)} 张图片。"
+            ),
+        )
+
+        preview_limit = min(5, len(ordered_image_ids))
+        for image_id in ordered_image_ids[:preview_limit]:
+            await self._send_review_group_preview(event, grouped.get(image_id, []))
+
+        if len(ordered_image_ids) > preview_limit:
+            yield event.plain_result(
+                f"其余 {len(ordered_image_ids) - preview_limit} 张图片未展开。可用 /pjsk图库 审核查看 <review_id> 查看单条审核。",
             )
-        yield event.plain_result("\n\n".join(lines))
+            return
+        yield event.plain_result("可继续使用 /pjsk图库 审核查看 <review_id> 查看单条审核。")
 
     @pjsk_gallery.command("审核查看")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -886,8 +940,8 @@ class PJSKPicPlugin(Star):
             yield event.plain_result("当前没有待处理审核图片。")
             return
 
-        image_path = self.db.get_image_file_path(int(task["image_id"])) or str(task["file_path"] or "")
-        if image_path and Path(image_path).exists():
+        image_path = self._review_image_path(int(task["image_id"]), str(task["file_path"] or ""))
+        if image_path:
             await event.send(MessageChain().file_image(str(image_path)))
 
         yield event.plain_result(

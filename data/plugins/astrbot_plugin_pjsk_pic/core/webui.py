@@ -33,6 +33,8 @@ HTML_PAGE = """<!DOCTYPE html>
     .card .body { padding: 10px; font-size: 13px; }
     .list { display: grid; gap: 10px; }
     .item { border: 1px solid #eceef2; border-radius: 8px; padding: 10px; }
+    .review-item { display: grid; grid-template-columns: 92px 1fr; gap: 10px; align-items: start; }
+    .review-item img { width: 92px; height: 92px; object-fit: cover; border-radius: 8px; background: #ddd; }
     .muted { color: #666; font-size: 12px; }
     .pill { display: inline-block; background: #eef2ff; color: #2f52d6; border-radius: 999px; padding: 2px 8px; margin: 2px 4px 2px 0; }
     .notice { margin-top: 8px; font-size: 12px; color: #dce4ff; }
@@ -193,13 +195,16 @@ async function loadReviews() {
   const q = new URLSearchParams({status: document.getElementById('reviewStatus').value, limit: '20'});
   const data = await fetchJson(`/api/reviews?${q.toString()}`);
   document.getElementById('reviews').innerHTML = (data.items || []).map(item => `
-    <div class="item">
-      <div><strong>#${item.id}</strong> [${item.status}] ${item.tag_name}</div>
-      <div class="muted">image=${item.image_id} · source=${item.source_type || '-'}</div>
-      <div>${item.reason || '-'}</div>
-      <div class="row">
-        <button onclick="reviewDecision(${item.id}, true)">通过</button>
-        <button class="secondary" onclick="reviewDecision(${item.id}, false)">拒绝</button>
+    <div class="item review-item">
+      <img src="${api(`/api/image-file?image_id=${item.image_id}`)}" loading="lazy" />
+      <div>
+        <div><strong>#${item.id}</strong> [${item.status}] ${item.tag_name}</div>
+        <div class="muted">image=${item.image_id} · source=${item.source_type || '-'}</div>
+        <div>${item.reason || '-'}</div>
+        <div class="row">
+          <button onclick="reviewDecision(${item.id}, true)">通过</button>
+          <button class="secondary" onclick="reviewDecision(${item.id}, false)">拒绝</button>
+        </div>
       </div>
     </div>
   `).join('') || '<div class="muted">暂无审核任务</div>';
@@ -376,19 +381,19 @@ class GalleryWebUI:
 
     async def ui_page(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)
-        if denied:
+        if denied is not None:
             return denied
         return web.Response(text=HTML_PAGE, content_type="text/html", charset="utf-8")
 
     async def api_summary(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)
-        if denied:
+        if denied is not None:
             return denied
         return self._json_response(self.db.get_stats())
 
     async def api_images(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)
-        if denied:
+        if denied is not None:
             return denied
         args = request.query
         rows = self.db.search_images(
@@ -424,7 +429,7 @@ class GalleryWebUI:
 
     async def api_image_detail(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)
-        if denied:
+        if denied is not None:
             return denied
         image_id = int(request.query.get("image_id", 0) or 0)
         detail = self.db.get_image_detail(image_id)
@@ -434,7 +439,7 @@ class GalleryWebUI:
 
     async def api_image_file(self, request: web.Request) -> web.StreamResponse:
         denied = self._check_access(request)
-        if denied:
+        if denied is not None:
             return denied
         image_id = int(request.query.get("image_id", 0) or 0)
         detail = self.db.get_image_detail(image_id)
@@ -448,7 +453,7 @@ class GalleryWebUI:
 
     async def api_tags(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)
-        if denied:
+        if denied is not None:
             return denied
         args = request.query
         rows = self.db.list_tags(
@@ -469,7 +474,7 @@ class GalleryWebUI:
 
     async def api_jobs(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)
-        if denied:
+        if denied is not None:
             return denied
         if request.method == "GET":
             rows = self.db.list_crawl_jobs(limit=50)
@@ -491,7 +496,7 @@ class GalleryWebUI:
 
     async def api_jobs_retry(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)
-        if denied:
+        if denied is not None:
             return denied
         data = await self._json_body(request)
         ok, message = await self.crawl_service.retry_job(int(data.get("job_id", 0) or 0))
@@ -499,7 +504,7 @@ class GalleryWebUI:
 
     async def api_reviews(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)
-        if denied:
+        if denied is not None:
             return denied
         args = request.query
         rows = self.db.list_review_tasks(
@@ -510,7 +515,7 @@ class GalleryWebUI:
 
     async def api_review_decision(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)
-        if denied:
+        if denied is not None:
             return denied
         data = await self._json_body(request)
         ok, message = self.db.apply_manual_review(
@@ -521,7 +526,7 @@ class GalleryWebUI:
 
     async def api_tag_alias(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)
-        if denied:
+        if denied is not None:
             return denied
         data = await self._json_body(request)
         tag_name = str(data.get("tag_name", "")).strip()
@@ -534,7 +539,7 @@ class GalleryWebUI:
 
     async def api_tag_character(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)
-        if denied:
+        if denied is not None:
             return denied
         data = await self._json_body(request)
         ok, message = self.db.set_tag_character(
