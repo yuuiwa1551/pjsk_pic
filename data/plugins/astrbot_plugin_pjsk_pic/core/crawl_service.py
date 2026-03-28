@@ -27,6 +27,9 @@ class CrawlService:
         self._worker_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
 
+    def _keep_primary_tags_only(self) -> bool:
+        return bool(self.config.get("crawl_keep_primary_tags_only", True))
+
     async def start(self) -> None:
         self.db.reset_running_jobs()
         self._stop_event.clear()
@@ -195,11 +198,18 @@ class CrawlService:
                     },
                 )
 
-                tags = self.tag_cleaner.clean_tags(
-                    self._merge_tags(manual_tags, [*candidate.raw_tags, *translated_tags]),
-                    platform=platform,
-                )
-                tags = self._collapse_similar_tags(tags, preferred_tags=[*manual_tags, *include_tags])
+                if self._keep_primary_tags_only():
+                    tags = self._canonicalize_primary_tags(
+                        manual_tags=manual_tags,
+                        include_tags=include_tags,
+                        raw_tags=[*candidate.raw_tags, *translated_tags],
+                    )
+                else:
+                    tags = self.tag_cleaner.clean_tags(
+                        self._merge_tags(manual_tags, [*candidate.raw_tags, *translated_tags]),
+                        platform=platform,
+                    )
+                    tags = self._collapse_similar_tags(tags, preferred_tags=[*manual_tags, *include_tags])
                 if not tags:
                     skipped_without_tags += 1
                     continue
@@ -294,6 +304,56 @@ class CrawlService:
     def _normalized_rule_tags(self, tags: Iterable[str]) -> set[str]:
         normalized = self.tag_cleaner.normalize_tags(list(tags), drop_noise=False)
         return {normalize_tag_name(tag) for tag in normalized if tag}
+
+    def _canonicalize_primary_tags(
+        self,
+        *,
+        manual_tags: Iterable[str],
+        include_tags: Iterable[str],
+        raw_tags: Iterable[str],
+    ) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+
+        def append_if_missing(tag_name: str) -> None:
+            normalized = normalize_tag_name(tag_name)
+            if not normalized or normalized in seen:
+                return
+            seen.add(normalized)
+            result.append(tag_name)
+
+        for tag in self.tag_cleaner.normalize_tags(list(manual_tags), drop_noise=False):
+            canonical = self._canonicalize_explicit_tag(tag)
+            if canonical:
+                append_if_missing(canonical)
+
+        for tag in self.tag_cleaner.normalize_tags(list(include_tags), drop_noise=False):
+            canonical = self._canonicalize_existing_character_tag(tag)
+            if canonical:
+                append_if_missing(canonical)
+
+        for tag in self.tag_cleaner.normalize_tags(list(raw_tags), drop_noise=False):
+            canonical = self._canonicalize_existing_character_tag(tag)
+            if canonical:
+                append_if_missing(canonical)
+
+        return result
+
+    def _canonicalize_explicit_tag(self, tag_name: str) -> str | None:
+        match = self.db.resolve_tag(tag_name, allow_fuzzy=False)
+        if match.matched and match.tag_name:
+            return str(match.tag_name)
+        normalized = self.tag_cleaner.normalize_tags([tag_name], drop_noise=False)
+        return normalized[0] if normalized else None
+
+    def _canonicalize_existing_character_tag(self, tag_name: str) -> str | None:
+        match = self.db.resolve_tag(tag_name, allow_fuzzy=False)
+        if not match.matched or not match.tag_name:
+            return None
+        row = self.db.get_tag_row(str(match.tag_name))
+        if not row or int(row["is_character"] or 0) != 1:
+            return None
+        return str(match.tag_name)
 
     @classmethod
     def _collapse_similar_tags(cls, tags: list[str], *, preferred_tags: Iterable[str]) -> list[str]:

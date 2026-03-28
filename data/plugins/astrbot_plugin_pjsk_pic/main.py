@@ -278,6 +278,12 @@ class PJSKPicPlugin(Star):
                 skipped.append(f"{alias}（{message}）")
         return removed, skipped
 
+    def _sync_auto_crawl_subscriptions_safe(self) -> None:
+        try:
+            self.auto_crawl_service._sync_subscriptions()
+        except Exception as exc:
+            logger.warning(f"[PJSKPic] 自动采集订阅同步失败: {exc}", exc_info=True)
+
     @staticmethod
     def _collect_display_tag_names(tags: list[dict], *, sendable_only: bool = False) -> list[str]:
         selected = tags
@@ -798,13 +804,148 @@ class PJSKPicPlugin(Star):
         lines.append(f"{canonical_tag_name} 的别名：{'、'.join(aliases)}")
         yield event.plain_result("\n".join(lines))
 
+    @pjsk_gallery.command("tag列表")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def list_tags_command(self, event: AstrMessageEvent, scope: str = ""):
+        scope_text = str(scope or "").strip()
+        lowered = scope_text.lower()
+        character_only: bool | None = True
+        keyword = ""
+        if lowered in {"全部", "all"}:
+            character_only = None
+        elif lowered in {"普通", "非角色", "noise", "normal"}:
+            character_only = False
+        elif scope_text and lowered not in {"角色", "character"}:
+            keyword = scope_text
+
+        rows = self.db.list_tags(keyword=keyword, limit=200, character_only=character_only)
+        if not rows:
+            yield event.plain_result("当前没有符合条件的 tag。")
+            return
+
+        if character_only is True:
+            header = "当前角色主 tag："
+        elif character_only is False:
+            header = "当前普通 tag（建议清理或先合并）："
+        else:
+            header = "当前全部主 tag："
+        lines = [header]
+        for row in rows[:60]:
+            state = "角色" if int(row["is_character"] or 0) == 1 else "普通"
+            lines.append(
+                f"- {row['name']}（{state}，图 {int(row['image_count'] or 0)}，alias {int(row['alias_count'] or 0)}）"
+            )
+        if len(rows) > 60:
+            lines.append(f"其余 {len(rows) - 60} 个未展开，可加关键词继续筛。")
+        yield event.plain_result("\n".join(lines))
+
+    @pjsk_gallery.command("tag合并")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def merge_tags_command(self, event: AstrMessageEvent, target_tag_name: str, source_tags: str):
+        source_values = self._parse_alias_csv(source_tags)
+        if not source_values:
+            yield event.plain_result("用法：/pjsk图库 tag合并 <目标tag> <来源tag1,来源tag2>")
+            return
+
+        ok, summary = self.db.merge_tags(target_tag_name, source_values)
+        if not ok and summary.get("message", "").startswith("目标 tag 不存在"):
+            yield event.plain_result(f"合并失败：{summary['message']}")
+            return
+        if ok:
+            self._sync_auto_crawl_subscriptions_safe()
+
+        lines: list[str] = []
+        target_name = str(summary.get("target_tag") or target_tag_name)
+        if summary.get("target_match_type") == "exact_alias":
+            lines.append(f"输入“{target_tag_name}”命中 alias，已归并到主 tag。")
+        lines.append(str(summary.get("message") or ("已归并到主 tag：" + target_name)))
+        merged_tags = list(summary.get("merged_tags") or [])
+        aliases_added = list(summary.get("aliases_added") or [])
+        skipped = list(summary.get("skipped") or [])
+        aliases_skipped = list(summary.get("aliases_skipped") or [])
+        if merged_tags:
+            lines.append("已合并 tag：" + "、".join(merged_tags))
+        if aliases_added:
+            lines.append("已直接挂为 alias：" + "、".join(aliases_added))
+        metrics = [
+            f"图片关联迁移 {int(summary.get('image_links_migrated') or 0)}",
+            f"审核任务迁移 {int(summary.get('review_tasks_migrated') or 0)}",
+            f"审核任务合并 {int(summary.get('review_tasks_merged') or 0)}",
+            f"alias 迁移 {int(summary.get('aliases_migrated') or 0)}",
+            f"订阅移除 {int(summary.get('subscriptions_removed') or 0)}",
+        ]
+        lines.append("；".join(metrics))
+        if aliases_skipped:
+            lines.append("以下 alias 未迁移：" + "；".join(aliases_skipped[:10]))
+        if skipped:
+            lines.append("以下项未处理：" + "；".join(skipped[:10]))
+        aliases = self.db.list_aliases(target_name)
+        lines.append(f"{target_name} 当前别名：" + ("、".join(aliases) if aliases else "无"))
+        yield event.plain_result("\n".join(lines))
+
+    @pjsk_gallery.command("主tag切换")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def switch_primary_tag_command(self, event: AstrMessageEvent, tag_name_or_alias: str, new_primary_name: str):
+        ok, summary = self.db.switch_primary_tag(tag_name_or_alias, new_primary_name)
+        if not ok:
+            yield event.plain_result(f"切换失败：{summary['message']}")
+            return
+        self._sync_auto_crawl_subscriptions_safe()
+
+        lines = []
+        if summary.get("match_type") == "exact_alias":
+            lines.append(f"输入“{tag_name_or_alias}”命中 alias，已归并到主 tag。")
+        lines.append(str(summary.get("message") or "已切换主 tag。"))
+        aliases = self.db.list_aliases(str(summary.get("new_name") or new_primary_name))
+        lines.append(
+            f"当前主 tag：{summary.get('new_name')}\n"
+            f"当前别名：{('、'.join(aliases) if aliases else '无')}"
+        )
+        yield event.plain_result("\n".join(lines))
+
     @pjsk_gallery.command("角色标记")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def set_character_tag(self, event: AstrMessageEvent, tag_name: str, is_character_text: str):
         value = str(is_character_text or "").strip().lower()
         is_character = value in {"1", "true", "yes", "y", "是"}
         ok, message = self.db.set_tag_character(tag_name, is_character)
+        if ok:
+            self._sync_auto_crawl_subscriptions_safe()
         yield event.plain_result(message if ok else f"设置失败：{message}")
+
+    @pjsk_gallery.command("tag清理预览")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def preview_tag_cleanup(self, event: AstrMessageEvent):
+        rows = self.db.preview_non_character_tag_cleanup(limit=200)
+        if not rows:
+            yield event.plain_result("当前没有普通 tag 需要清理。")
+            return
+        lines = [
+            "以下普通 tag 清理后会被删除；如需保留，请先用 /pjsk图库 tag合并 归并到角色主 tag：",
+        ]
+        for row in rows[:60]:
+            lines.append(f"- {row['name']}（图 {int(row['image_count'] or 0)}，alias {int(row['alias_count'] or 0)}）")
+        if len(rows) > 60:
+            lines.append(f"其余 {len(rows) - 60} 个未展开。")
+        lines.append("执行命令：/pjsk图库 tag清理执行 确认")
+        yield event.plain_result("\n".join(lines))
+
+    @pjsk_gallery.command("tag清理执行")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def execute_tag_cleanup(self, event: AstrMessageEvent, confirm_text: str = ""):
+        if str(confirm_text or "").strip().lower() not in {"确认", "confirm", "yes", "y"}:
+            yield event.plain_result("该操作会删除所有普通 tag 及其图片关联。确认执行：/pjsk图库 tag清理执行 确认")
+            return
+        summary = self.db.cleanup_non_character_tags()
+        self._sync_auto_crawl_subscriptions_safe()
+        yield event.plain_result(
+            "普通 tag 清理完成：\n"
+            f"删除 tag {summary['tags_removed']} 个，"
+            f"图片关联 {summary['image_links_removed']} 条，"
+            f"审核任务 {summary['review_tasks_removed']} 条，"
+            f"alias {summary['aliases_removed']} 条，"
+            f"自动订阅 {summary['subscriptions_removed']} 条。"
+        )
 
     @pjsk_gallery.command("采集添加")
     @filter.permission_type(filter.PermissionType.ADMIN)

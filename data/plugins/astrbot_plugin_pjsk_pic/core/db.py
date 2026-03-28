@@ -784,6 +784,265 @@ class ImageIndexDB:
         with self._lock, self._connect() as conn:
             return conn.execute('SELECT * FROM tags WHERE id = ?', (tag_id,)).fetchone()
 
+    @staticmethod
+    def _resolve_tag_exact_conn(conn: sqlite3.Connection, query: str) -> tuple[sqlite3.Row | None, str]:
+        normalized = normalize_tag_name(query)
+        if not normalized:
+            return None, ''
+        exact_tag = conn.execute('SELECT * FROM tags WHERE normalized_name = ? LIMIT 1', (normalized,)).fetchone()
+        if exact_tag:
+            return exact_tag, 'exact_tag'
+        exact_alias = conn.execute(
+            """
+            SELECT t.*
+            FROM tag_aliases a
+            JOIN tags t ON t.id = a.tag_id
+            WHERE a.normalized_alias = ?
+            LIMIT 1
+            """,
+            (normalized,),
+        ).fetchone()
+        if exact_alias:
+            return exact_alias, 'exact_alias'
+        return None, ''
+
+    @staticmethod
+    def _get_alias_usage_conn(conn: sqlite3.Connection, normalized_alias: str) -> sqlite3.Row | None:
+        return conn.execute(
+            """
+            SELECT a.id, a.tag_id, a.alias, t.name AS tag_name
+            FROM tag_aliases a
+            JOIN tags t ON t.id = a.tag_id
+            WHERE a.normalized_alias = ?
+            LIMIT 1
+            """,
+            (normalized_alias,),
+        ).fetchone()
+
+    def _insert_alias_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        tag_id: int,
+        alias: str,
+        now: str | None = None,
+    ) -> tuple[bool, str]:
+        alias_text = str(alias or '').strip()
+        if not alias_text:
+            return False, 'alias 不能为空'
+        target = conn.execute('SELECT id, name, normalized_name FROM tags WHERE id = ? LIMIT 1', (tag_id,)).fetchone()
+        if not target:
+            return False, f'tag 不存在：{tag_id}'
+
+        normalized_alias = normalize_tag_name(alias_text)
+        if not normalized_alias:
+            return False, 'alias 不能为空'
+        if normalized_alias == str(target['normalized_name'] or ''):
+            return False, f'alias 不能与主 tag 相同：{alias_text}'
+
+        conflict_tag = conn.execute(
+            'SELECT id, name FROM tags WHERE normalized_name = ? LIMIT 1',
+            (normalized_alias,),
+        ).fetchone()
+        if conflict_tag:
+            if int(conflict_tag['id']) == int(tag_id):
+                return False, f'alias 不能与主 tag 相同：{alias_text}'
+            return False, f'alias 与现有 tag 冲突：{conflict_tag["name"]}'
+
+        alias_usage = self._get_alias_usage_conn(conn, normalized_alias)
+        if alias_usage:
+            if int(alias_usage['tag_id']) == int(tag_id):
+                return False, f'alias 已存在：{alias_text}'
+            return False, f'alias 已被 {alias_usage["tag_name"]} 使用：{alias_text}'
+
+        conn.execute(
+            'INSERT INTO tag_aliases(tag_id, alias, normalized_alias, created_at) VALUES(?, ?, ?, ?)',
+            (tag_id, alias_text, normalized_alias, now or utcnow_str()),
+        )
+        return True, f'已添加别名：{target["name"]} -> {alias_text}'
+
+    @staticmethod
+    def _preferred_review_task_status(*statuses: str) -> str:
+        valid = [str(item or '').strip() for item in statuses if str(item or '').strip()]
+        if not valid:
+            return 'pending'
+        return max(valid, key=lambda item: (IMAGE_TAG_STATUS_PRIORITY.get(item, -1), item))
+
+    def _merge_tag_into_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        target_id: int,
+        target_name: str,
+        source_id: int,
+        now: str,
+    ) -> dict[str, Any]:
+        target = conn.execute('SELECT * FROM tags WHERE id = ? LIMIT 1', (target_id,)).fetchone()
+        source = conn.execute('SELECT * FROM tags WHERE id = ? LIMIT 1', (source_id,)).fetchone()
+        if not target or not source:
+            raise ValueError('tag_not_found')
+        if int(target['id']) == int(source['id']):
+            return {
+                'source_name': str(source['name']),
+                'image_links_migrated': 0,
+                'review_tasks_migrated': 0,
+                'review_tasks_merged': 0,
+                'aliases_migrated': 0,
+                'aliases_skipped': [],
+                'source_name_alias_added': False,
+                'subscriptions_removed': 0,
+            }
+
+        image_links_migrated = 0
+        source_image_tags = conn.execute(
+            """
+            SELECT id, image_id, source_type, score, review_status, review_reason, created_at
+            FROM image_tags
+            WHERE tag_id = ?
+            """,
+            (source_id,),
+        ).fetchall()
+        for row in source_image_tags:
+            existing = conn.execute(
+                """
+                SELECT id, score, review_status, review_reason
+                FROM image_tags
+                WHERE image_id = ? AND tag_id = ? AND source_type = ?
+                LIMIT 1
+                """,
+                (int(row['image_id']), target_id, str(row['source_type'])),
+            ).fetchone()
+            merged_status = self._preferred_image_tag_status(
+                str(existing['review_status'] or '') if existing else '',
+                str(row['review_status'] or ''),
+            )
+            merged_score = max(
+                float(existing['score'] or 0.0) if existing else 0.0,
+                float(row['score'] or 0.0),
+            )
+            merged_reason = (
+                str(existing['review_reason'] or '') if existing and str(existing['review_reason'] or '').strip()
+                else str(row['review_reason'] or '')
+            )
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE image_tags
+                    SET score = ?, review_status = ?, review_reason = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (merged_score, merged_status, merged_reason, now, int(existing['id'])),
+                )
+                conn.execute('DELETE FROM image_tags WHERE id = ?', (int(row['id']),))
+            else:
+                conn.execute(
+                    """
+                    UPDATE image_tags
+                    SET tag_id = ?, review_status = ?, review_reason = ?, score = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (target_id, merged_status, merged_reason, merged_score, now, int(row['id'])),
+                )
+            image_links_migrated += 1
+
+        review_tasks_migrated = 0
+        review_tasks_merged = 0
+        source_reviews = conn.execute(
+            """
+            SELECT id, image_id, status, model_result, manual_result, reason, created_at
+            FROM review_tasks
+            WHERE tag_id = ?
+            """,
+            (source_id,),
+        ).fetchall()
+        for row in source_reviews:
+            existing = conn.execute(
+                """
+                SELECT id, status, model_result, manual_result, reason
+                FROM review_tasks
+                WHERE image_id = ? AND tag_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (int(row['image_id']), target_id),
+            ).fetchone()
+            merged_status = self._preferred_review_task_status(
+                str(existing['status'] or '') if existing else '',
+                str(row['status'] or ''),
+            )
+            merged_model_result = (
+                str(existing['model_result'] or '') if existing and str(existing['model_result'] or '').strip()
+                else str(row['model_result'] or '')
+            )
+            merged_manual_result = (
+                str(existing['manual_result'] or '') if existing and str(existing['manual_result'] or '').strip()
+                else str(row['manual_result'] or '')
+            )
+            merged_reason = (
+                str(existing['reason'] or '') if existing and str(existing['reason'] or '').strip()
+                else str(row['reason'] or '')
+            )
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE review_tasks
+                    SET status = ?, model_result = ?, manual_result = ?, reason = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (merged_status, merged_model_result, merged_manual_result, merged_reason, now, int(existing['id'])),
+                )
+                conn.execute('DELETE FROM review_tasks WHERE id = ?', (int(row['id']),))
+                review_tasks_merged += 1
+            else:
+                conn.execute(
+                    """
+                    UPDATE review_tasks
+                    SET tag_id = ?, status = ?, model_result = ?, manual_result = ?, reason = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (target_id, merged_status, merged_model_result, merged_manual_result, merged_reason, now, int(row['id'])),
+                )
+                review_tasks_migrated += 1
+
+        source_alias_rows = conn.execute(
+            'SELECT alias FROM tag_aliases WHERE tag_id = ? ORDER BY id ASC',
+            (source_id,),
+        ).fetchall()
+        conn.execute('DELETE FROM tag_aliases WHERE tag_id = ?', (source_id,))
+        aliases_migrated = 0
+        aliases_skipped: list[str] = []
+        for row in source_alias_rows:
+            alias = str(row['alias'] or '').strip()
+            if not alias:
+                continue
+            ok, message = self._insert_alias_conn(conn, tag_id=target_id, alias=alias, now=now)
+            if ok:
+                aliases_migrated += 1
+            else:
+                aliases_skipped.append(f'{alias}（{message}）')
+
+        source_name_alias_added = False
+        delete_cursor = conn.execute('DELETE FROM crawl_subscriptions WHERE tag_id = ?', (source_id,))
+        subscriptions_removed = max(0, int(delete_cursor.rowcount or 0))
+        conn.execute('DELETE FROM tags WHERE id = ?', (source_id,))
+
+        ok, _ = self._insert_alias_conn(conn, tag_id=target_id, alias=str(source['name']), now=now)
+        source_name_alias_added = ok
+
+        if int(source['is_character'] or 0) == 1 and int(target['is_character'] or 0) != 1:
+            conn.execute('UPDATE tags SET is_character = 1 WHERE id = ?', (target_id,))
+
+        return {
+            'source_name': str(source['name']),
+            'image_links_migrated': image_links_migrated,
+            'review_tasks_migrated': review_tasks_migrated,
+            'review_tasks_merged': review_tasks_merged,
+            'aliases_migrated': aliases_migrated,
+            'aliases_skipped': aliases_skipped,
+            'source_name_alias_added': source_name_alias_added,
+            'subscriptions_removed': subscriptions_removed,
+        }
+
     def link_image_tag(self, image_id: int, tag_id: int, source_type: str = 'directory', review_status: str = 'approved', score: float = 1.0, review_reason: str = '') -> None:
         now = utcnow_str()
         with self._lock, self._connect() as conn:
@@ -818,32 +1077,8 @@ class ImageIndexDB:
         tag_id = self.get_tag_id(tag_name)
         if tag_id is None:
             return False, f'tag \u4E0D\u5B58\u5728\uFF1A{tag_name}'
-        normalized_tag = normalize_tag_name(tag_name)
-        normalized = normalize_tag_name(alias)
-        if normalized == normalized_tag:
-            return False, f'alias \u4E0D\u80FD\u4E0E\u4E3B tag \u76F8\u540C\uFF1A{alias}'
         with self._lock, self._connect() as conn:
-            conflict_tag = conn.execute(
-                'SELECT id, name FROM tags WHERE normalized_name = ? LIMIT 1',
-                (normalized,),
-            ).fetchone()
-            if conflict_tag:
-                if int(conflict_tag['id']) == tag_id:
-                    return False, f'alias \u4E0D\u80FD\u4E0E\u4E3B tag \u76F8\u540C\uFF1A{alias}'
-                return False, f'alias \u4E0E\u73B0\u6709 tag \u51B2\u7A81\uFF1A{conflict_tag["name"]}'
-            exists = conn.execute(
-                "SELECT a.tag_id, t.name FROM tag_aliases a JOIN tags t ON t.id = a.tag_id WHERE a.normalized_alias = ? LIMIT 1",
-                (normalized,),
-            ).fetchone()
-            if exists:
-                if int(exists['tag_id']) == tag_id:
-                    return False, f'alias \u5DF2\u5B58\u5728\uFF1A{alias}'
-                return False, f'alias \u5DF2\u88AB {exists["name"]} \u4F7F\u7528\uFF1A{alias}'
-            conn.execute(
-                'INSERT INTO tag_aliases(tag_id, alias, normalized_alias, created_at) VALUES(?, ?, ?, ?)',
-                (tag_id, alias, normalized, utcnow_str()),
-            )
-        return True, f'\u5DF2\u6DFB\u52A0\u522B\u540D\uFF1A{tag_name} -> {alias}'
+            return self._insert_alias_conn(conn, tag_id=tag_id, alias=alias, now=utcnow_str())
 
     def remove_alias(self, tag_name: str, alias: str) -> tuple[bool, str]:
         tag_id = self.get_tag_id(tag_name.strip())
@@ -951,6 +1186,134 @@ class ImageIndexDB:
             row = candidates[0]
             return MatchResult(matched=True, tag_id=int(row['id']), tag_name=str(row['name']), match_type='fuzzy')
         return MatchResult(matched=False, candidates=[str(row['name']) for row in candidates[:candidate_limit]])
+
+    def merge_tags(self, target_tag_name: str, source_tag_names: Iterable[str]) -> tuple[bool, dict[str, Any]]:
+        requested_sources: list[str] = []
+        seen_sources: set[str] = set()
+        for raw in source_tag_names:
+            text = str(raw or '').strip()
+            normalized = normalize_tag_name(text)
+            if not text or not normalized or normalized in seen_sources:
+                continue
+            seen_sources.add(normalized)
+            requested_sources.append(text)
+        if not requested_sources:
+            return False, {'message': '请至少提供一个来源 tag。'}
+
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            target_row, target_match_type = self._resolve_tag_exact_conn(conn, target_tag_name)
+            if not target_row:
+                return False, {'message': f'目标 tag 不存在：{target_tag_name}'}
+            target_id = int(target_row['id'])
+            target_name = str(target_row['name'])
+            target_normalized = str(target_row['normalized_name'] or '')
+            summary: dict[str, Any] = {
+                'message': '',
+                'target_tag': target_name,
+                'target_match_type': target_match_type,
+                'merged_tags': [],
+                'aliases_added': [],
+                'skipped': [],
+                'image_links_migrated': 0,
+                'review_tasks_migrated': 0,
+                'review_tasks_merged': 0,
+                'aliases_migrated': 0,
+                'subscriptions_removed': 0,
+                'aliases_skipped': [],
+            }
+
+            for source_text in requested_sources:
+                source_row, _ = self._resolve_tag_exact_conn(conn, source_text)
+                if not source_row:
+                    ok, message = self._insert_alias_conn(conn, tag_id=target_id, alias=source_text, now=now)
+                    if ok:
+                        summary['aliases_added'].append(source_text)
+                    else:
+                        summary['skipped'].append(f'{source_text}（{message}）')
+                    continue
+
+                source_id = int(source_row['id'])
+                source_name = str(source_row['name'])
+                source_normalized = str(source_row['normalized_name'] or '')
+                if source_id == target_id or source_normalized == target_normalized:
+                    summary['skipped'].append(f'{source_text}（已归并到 {target_name}）')
+                    continue
+
+                result = self._merge_tag_into_conn(
+                    conn,
+                    target_id=target_id,
+                    target_name=target_name,
+                    source_id=source_id,
+                    now=now,
+                )
+                summary['merged_tags'].append(result['source_name'])
+                summary['image_links_migrated'] += int(result['image_links_migrated'])
+                summary['review_tasks_migrated'] += int(result['review_tasks_migrated'])
+                summary['review_tasks_merged'] += int(result['review_tasks_merged'])
+                summary['aliases_migrated'] += int(result['aliases_migrated'])
+                summary['subscriptions_removed'] += int(result['subscriptions_removed'])
+                summary['aliases_skipped'].extend(list(result.get('aliases_skipped') or []))
+
+            merged_count = len(summary['merged_tags'])
+            alias_count = len(summary['aliases_added'])
+            if merged_count == 0 and alias_count == 0:
+                summary['message'] = '没有发生可执行的 tag 变更。'
+                return False, summary
+            summary['message'] = f'已归并到主 tag：{target_name}'
+            return True, summary
+
+    def switch_primary_tag(self, tag_name_or_alias: str, new_primary_name: str) -> tuple[bool, dict[str, Any]]:
+        new_name = str(new_primary_name or '').strip()
+        if not new_name:
+            return False, {'message': '新主 tag 不能为空。'}
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            current_row, match_type = self._resolve_tag_exact_conn(conn, tag_name_or_alias)
+            if not current_row:
+                return False, {'message': f'没有找到 tag 或 alias：{tag_name_or_alias}'}
+            current_id = int(current_row['id'])
+            current_name = str(current_row['name'])
+            current_normalized = str(current_row['normalized_name'] or '')
+            new_normalized = normalize_tag_name(new_name)
+            if not new_normalized:
+                return False, {'message': '新主 tag 不能为空。'}
+            if new_normalized == current_normalized and new_name == current_name:
+                return False, {'message': '新主 tag 与当前主 tag 相同。'}
+
+            conflict_tag = conn.execute(
+                'SELECT id, name FROM tags WHERE normalized_name = ? LIMIT 1',
+                (new_normalized,),
+            ).fetchone()
+            if conflict_tag and int(conflict_tag['id']) != current_id:
+                return False, {'message': f'新主 tag 与现有 tag 冲突：{conflict_tag["name"]}'}
+
+            alias_usage = self._get_alias_usage_conn(conn, new_normalized)
+            if alias_usage and int(alias_usage['tag_id']) != current_id:
+                return False, {'message': f'新主 tag 已被 {alias_usage["tag_name"]} 的 alias 使用：{new_name}'}
+
+            conn.execute(
+                'DELETE FROM tag_aliases WHERE tag_id = ? AND normalized_alias = ?',
+                (current_id, new_normalized),
+            )
+            conn.execute(
+                'UPDATE tags SET name = ?, normalized_name = ? WHERE id = ?',
+                (new_name, new_normalized, current_id),
+            )
+
+            old_name_promoted_to_alias = False
+            if current_normalized != new_normalized:
+                ok, _ = self._insert_alias_conn(conn, tag_id=current_id, alias=current_name, now=now)
+                old_name_promoted_to_alias = ok
+
+            return True, {
+                'message': f'已切换主 tag：{current_name} -> {new_name}',
+                'tag_id': current_id,
+                'old_name': current_name,
+                'new_name': new_name,
+                'match_type': match_type,
+                'old_name_promoted_to_alias': old_name_promoted_to_alias,
+            }
 
     def get_random_image_for_tag(self, tag_id: int, excluded_image_ids: list[int] | None = None) -> sqlite3.Row | None:
         excluded_image_ids = excluded_image_ids or []
@@ -1361,22 +1724,69 @@ class ImageIndexDB:
             self._sync_image_file_state(conn, image_id, preferred_path=restored_path, now=now)
         return True, f'已恢复图片 #{image_id}。'
 
-    def list_tags(self, *, keyword: str = '', limit: int = 100) -> list[sqlite3.Row]:
+    def list_tags(self, *, keyword: str = '', limit: int = 100, character_only: bool | None = None) -> list[sqlite3.Row]:
         sql = """
             SELECT t.id, t.name, t.is_character,
-                   COUNT(DISTINCT CASE WHEN it.review_status IN ('approved', 'manual_approved') AND i.is_active = 1 THEN i.id END) AS image_count
+                   COUNT(DISTINCT CASE WHEN it.review_status IN ('approved', 'manual_approved') AND i.is_active = 1 THEN i.id END) AS image_count,
+                   COUNT(DISTINCT a.id) AS alias_count
             FROM tags t
+            LEFT JOIN tag_aliases a ON a.tag_id = t.id
             LEFT JOIN image_tags it ON it.tag_id = t.id
             LEFT JOIN images i ON i.id = it.image_id
         """
         params: list[Any] = []
+        clauses: list[str] = []
+        if character_only is not None:
+            clauses.append('t.is_character = ?')
+            params.append(1 if character_only else 0)
         if keyword:
-            sql += ' WHERE t.normalized_name LIKE ?'
+            clauses.append('t.normalized_name LIKE ?')
             params.append(f"%{normalize_tag_name(keyword)}%")
+        if clauses:
+            sql += ' WHERE ' + ' AND '.join(clauses)
         sql += ' GROUP BY t.id, t.name, t.is_character ORDER BY image_count DESC, t.name ASC LIMIT ?'
         params.append(limit)
         with self._lock, self._connect() as conn:
             return conn.execute(sql, params).fetchall()
+
+    def preview_non_character_tag_cleanup(self, *, limit: int = 200) -> list[sqlite3.Row]:
+        return self.list_tags(limit=limit, character_only=False)
+
+    def cleanup_non_character_tags(self) -> dict[str, int]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute('SELECT id, normalized_name FROM tags WHERE is_character = 0').fetchall()
+            if not rows:
+                return {
+                    'tags_removed': 0,
+                    'image_links_removed': 0,
+                    'review_tasks_removed': 0,
+                    'aliases_removed': 0,
+                    'subscriptions_removed': 0,
+                }
+            tag_ids = [int(row['id']) for row in rows]
+            normalized_names = [str(row['normalized_name'] or '') for row in rows if str(row['normalized_name'] or '').strip()]
+            id_placeholders = ','.join('?' for _ in tag_ids)
+
+            image_cursor = conn.execute(f'DELETE FROM image_tags WHERE tag_id IN ({id_placeholders})', tag_ids)
+            review_cursor = conn.execute(f'DELETE FROM review_tasks WHERE tag_id IN ({id_placeholders})', tag_ids)
+            alias_cursor = conn.execute(f'DELETE FROM tag_aliases WHERE tag_id IN ({id_placeholders})', tag_ids)
+
+            subscription_sql = f'DELETE FROM crawl_subscriptions WHERE tag_id IN ({id_placeholders})'
+            subscription_params: list[Any] = list(tag_ids)
+            if normalized_names:
+                normalized_placeholders = ','.join('?' for _ in normalized_names)
+                subscription_sql += f' OR normalized_tag IN ({normalized_placeholders})'
+                subscription_params.extend(normalized_names)
+            subscription_cursor = conn.execute(subscription_sql, subscription_params)
+            tag_cursor = conn.execute(f'DELETE FROM tags WHERE id IN ({id_placeholders})', tag_ids)
+
+            return {
+                'tags_removed': max(0, int(tag_cursor.rowcount or 0)),
+                'image_links_removed': max(0, int(image_cursor.rowcount or 0)),
+                'review_tasks_removed': max(0, int(review_cursor.rowcount or 0)),
+                'aliases_removed': max(0, int(alias_cursor.rowcount or 0)),
+                'subscriptions_removed': max(0, int(subscription_cursor.rowcount or 0)),
+            }
 
     def list_tags_for_auto_crawl(self, *, character_only: bool = True) -> list[sqlite3.Row]:
         sql = 'SELECT id, name, is_character FROM tags'
