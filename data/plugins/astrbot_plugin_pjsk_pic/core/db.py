@@ -18,14 +18,19 @@ def utcnow_str() -> str:
 
 class ImageIndexDB:
     def __init__(self, db_path: Path) -> None:
-        self.db_path = db_path
+        self.db_path = Path(db_path).expanduser().resolve()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA busy_timeout=30000;")
+            conn.execute("PRAGMA temp_store=MEMORY;")
+        except sqlite3.OperationalError:
+            pass
         return conn
 
     def _table_columns(self, conn: sqlite3.Connection, table: str) -> set[str]:
@@ -40,8 +45,6 @@ class ImageIndexDB:
         with self._lock, self._connect() as conn:
             conn.executescript(
                 """
-                PRAGMA journal_mode=WAL;
-
                 CREATE TABLE IF NOT EXISTS images (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     file_path TEXT NOT NULL UNIQUE,
@@ -184,6 +187,10 @@ class ImageIndexDB:
                 CREATE INDEX IF NOT EXISTS idx_send_logs_session_id ON send_logs(session_id);
                 """
             )
+            try:
+                conn.execute("PRAGMA journal_mode=DELETE;")
+            except sqlite3.OperationalError:
+                pass
 
             self._ensure_column(conn, 'images', 'phash', "TEXT DEFAULT ''")
             self._ensure_column(conn, 'tags', 'is_character', 'INTEGER DEFAULT 0')

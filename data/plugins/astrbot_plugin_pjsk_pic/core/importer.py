@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import mimetypes
+import time
 import urllib.parse
+import urllib.error
 import urllib.request
 from io import BytesIO
 from pathlib import Path
@@ -50,6 +52,7 @@ class ImportedImageService:
         self.timeout_seconds = timeout_seconds
         self.enable_phash_dedupe = enable_phash_dedupe
         self.phash_max_distance = phash_max_distance
+        self.download_retry_times = 3
 
     async def import_candidate(self, candidate: CrawlCandidate) -> ImportedImage:
         return await asyncio.to_thread(self._import_candidate_sync, candidate)
@@ -61,11 +64,7 @@ class ImportedImageService:
         headers = dict(DEFAULT_HEADERS)
         extra_headers = candidate.extra.get("request_headers", {}) if isinstance(candidate.extra, dict) else {}
         headers.update({str(k): str(v) for k, v in dict(extra_headers).items()})
-        request = urllib.request.Request(candidate.image_url, headers=headers)
-        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-            body = response.read()
-            content_type = response.headers.get("Content-Type", "")
-            final_url = response.geturl()
+        body, content_type, final_url = self._download_remote_bytes(candidate.image_url, headers=headers)
 
         return self._store_imported_bytes(
             body,
@@ -73,6 +72,32 @@ class ImportedImageService:
             content_type=content_type,
             platform=candidate.platform,
         )
+
+    def _download_remote_bytes(self, image_url: str, *, headers: dict[str, str]) -> tuple[bytes, str, str]:
+        last_error: Exception | None = None
+        max_attempts = max(1, int(self.download_retry_times or 1))
+        for attempt in range(1, max_attempts + 1):
+            request = urllib.request.Request(image_url, headers=headers)
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                    return (
+                        response.read(),
+                        response.headers.get("Content-Type", ""),
+                        response.geturl(),
+                    )
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                last_error = exc
+                if attempt >= max_attempts:
+                    raise
+                time.sleep(min(1.5 * attempt, 3.0))
+            except Exception as exc:
+                last_error = exc
+                if attempt >= max_attempts:
+                    raise
+                time.sleep(min(1.5 * attempt, 3.0))
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("download failed without a captured error")
 
     def _import_local_file_sync(self, source_path: Path, platform: str) -> ImportedImage:
         body = source_path.read_bytes()

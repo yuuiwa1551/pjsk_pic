@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 import urllib.parse
 
 import requests
@@ -39,6 +40,7 @@ def _request_json(
     headers: dict[str, str] | None = None,
     data: dict[str, Any] | None = None,
     timeout_seconds: int = 20,
+    retry_times: int = 3,
 ) -> dict[str, Any]:
     request_headers = {
         "User-Agent": PIXIV_APP_USER_AGENT,
@@ -51,24 +53,46 @@ def _request_json(
     if data is not None:
         body = {str(key): value for key, value in data.items()}
         request_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
-    try:
-        response = requests.request(
-            method.upper(),
-            url,
-            headers=request_headers,
-            data=body,
-            timeout=max(5, int(timeout_seconds or 20)),
-        )
-        response.raise_for_status()
-        payload = response.text
-    except requests.HTTPError as exc:
-        payload = getattr(exc.response, 'text', '') if getattr(exc, 'response', None) is not None else ''
-        status_code = getattr(exc.response, 'status_code', 'unknown') if getattr(exc, 'response', None) is not None else 'unknown'
-        raise PixivAppAPIError(f"HTTP {status_code}: {payload or exc}") from exc
-    except requests.RequestException as exc:
-        raise PixivAppAPIError(f"?????{exc}") from exc
-    except Exception as exc:
-        raise PixivAppAPIError(f"?????{exc}") from exc
+    last_error: Exception | None = None
+    payload = ""
+    max_attempts = max(1, int(retry_times or 1))
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.request(
+                method.upper(),
+                url,
+                headers=request_headers,
+                data=body,
+                timeout=max(5, int(timeout_seconds or 20)),
+            )
+            response.raise_for_status()
+            payload = response.text
+            last_error = None
+            break
+        except requests.HTTPError as exc:
+            payload = getattr(exc.response, "text", "") if getattr(exc, "response", None) is not None else ""
+            status_code = getattr(exc.response, "status_code", "unknown") if getattr(exc, "response", None) is not None else "unknown"
+            retryable = isinstance(status_code, int) and status_code in {408, 409, 425, 429, 500, 502, 503, 504}
+            if retryable and attempt < max_attempts:
+                last_error = exc
+                time.sleep(min(1.5 * attempt, 3.0))
+                continue
+            raise PixivAppAPIError(f"HTTP {status_code}: {payload or exc}") from exc
+        except requests.RequestException as exc:
+            if attempt < max_attempts:
+                last_error = exc
+                time.sleep(min(1.5 * attempt, 3.0))
+                continue
+            raise PixivAppAPIError(f"请求失败：{exc}") from exc
+        except Exception as exc:
+            if attempt < max_attempts:
+                last_error = exc
+                time.sleep(min(1.5 * attempt, 3.0))
+                continue
+            raise PixivAppAPIError(f"请求失败：{exc}") from exc
+
+    if last_error is not None:
+        raise PixivAppAPIError(f"请求失败：{last_error}") from last_error
 
     try:
         parsed = json.loads(payload)
