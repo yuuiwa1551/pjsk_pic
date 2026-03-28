@@ -3,8 +3,9 @@ import unicodedata
 
 TRIGGER_PATTERNS = [
     re.compile(r"^(?:看看|看下|看一看)(.+?)(?:的?(?:图片|图))?$"),
+    re.compile(r"^(?:看)(.+?)(?:的?(?:图片|图))?$"),
     re.compile(r"^(?:来张|来一张|发一张)(.+?)(?:的?(?:图片|图))?$"),
-    re.compile(r"^(?:来点)(.+?)(?:图片|图)$"),
+    re.compile(r"^(?:来点)(?!图$|图片$)(.+?)(?:图片|图)?$"),
 ]
 
 NOISE_SUFFIXES = [

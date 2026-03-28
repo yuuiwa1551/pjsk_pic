@@ -75,21 +75,31 @@ class SubmissionNotifyService:
 
     @staticmethod
     def build_message(result: SubmissionResult) -> str:
-        review_no = result.review_id if result.review_id is not None else result.image_id
-        lines = [f"[PJSKPic] 收到新投稿 #{review_no or '-'}", f"主 tag：{result.tag_name or '-'}"]
+        review_ids = result.review_ids
+        lines = ["[PJSKPic] 收到新投稿", f"主 tag：{result.tag_name or '-'}"]
+        if result.resolved_from_alias and result.input_tag_name:
+            lines.append(f"输入 tag：{result.input_tag_name}（已自动归并）")
+        lines.append(
+            f"图片：{result.image_count} 张（已处理 {result.processed_count} / 已通过 {result.approved_count} / "
+            f"待审 {result.pending_count} / 拒绝 {result.rejected_count} / 失败 {result.failure_count}）",
+        )
         if result.aliases:
             lines.append("新增别名：" + "、".join(result.aliases))
-        lines.append(f"审核状态：{result.review_status or '-'}")
-        lines.append(f"投稿人：{result.sender_name or result.sender_id or '-'}")
-        lines.append(f"来源平台：{result.platform_name or '-'}")
+        if result.sender_name or result.sender_id:
+            lines.append(f"投稿人：{result.sender_name or result.sender_id}")
+        if result.platform_name:
+            lines.append(f"来源平台：{result.platform_name}")
         if result.session_id:
             lines.append(f"来源会话：{result.session_id}")
         if result.message_id:
             lines.append(f"原消息：{result.message_id}")
-        if result.review_id is not None:
-            lines.append(
-                f"处理命令：/pjsk图库 审核通过 {result.review_id}；/pjsk图库 审核拒绝 {result.review_id}",
-            )
+        if review_ids:
+            preview = "、".join(str(review_id) for review_id in review_ids[:10])
+            lines.append(f"待处理 review_id：{preview}")
+            if len(review_ids) == 1:
+                lines.append(f"处理命令：/pjsk图库 审核通过 {review_ids[0]}；/pjsk图库 审核拒绝 {review_ids[0]}")
+            else:
+                lines.append("可先用：/pjsk图库 审核查看 <review_id>")
         return "\n".join(lines)
 
     async def notify(self, event, result: SubmissionResult) -> int:

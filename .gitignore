@@ -1,7 +1,7 @@
-﻿__pycache__/
+__pycache__/
 *.pyc
 *.pyo
-*.db
-*.sqlite
-*.log
-.DS_Store
+plan.md
+*?plan.md
+data/plugin_data/
+data/config/

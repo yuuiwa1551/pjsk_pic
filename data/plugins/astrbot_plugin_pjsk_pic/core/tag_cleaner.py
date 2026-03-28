@@ -27,17 +27,24 @@ class TagCleaner:
         blacklist.update(custom)
 
         result: list[str] = []
+        for tag in self.normalize_tags(tags):
+            lowered = tag.lower()
+            if lowered in blacklist:
+                continue
+            result.append(tag)
+        return result
+
+    def normalize_tags(self, tags: list[str], *, drop_noise: bool = True) -> list[str]:
+        result: list[str] = []
         seen: set[str] = set()
         for raw in tags:
             for item in self._split_tag(raw):
                 tag = self._normalize_tag(item)
                 if not tag:
                     continue
+                if drop_noise and self._looks_like_noise(tag):
+                    continue
                 lowered = tag.lower()
-                if lowered in blacklist:
-                    continue
-                if self._looks_like_noise(tag):
-                    continue
                 if lowered in seen:
                     continue
                 seen.add(lowered)

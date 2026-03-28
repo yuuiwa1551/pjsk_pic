@@ -119,12 +119,33 @@ class ImageIndexDB:
                     platform TEXT NOT NULL,
                     source_url TEXT NOT NULL,
                     tags_text TEXT DEFAULT '',
+                    include_tags_text TEXT DEFAULT '',
+                    exclude_tags_text TEXT DEFAULT '',
+                    tag_match_mode TEXT DEFAULT 'exact',
                     status TEXT NOT NULL DEFAULT 'pending',
                     progress INTEGER DEFAULT 0,
                     error_log TEXT DEFAULT '',
                     result_summary TEXT DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS crawl_subscriptions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    platform TEXT NOT NULL,
+                    tag_id INTEGER DEFAULT 0,
+                    tag_name TEXT NOT NULL,
+                    normalized_tag TEXT NOT NULL,
+                    query_text TEXT DEFAULT '',
+                    enabled INTEGER DEFAULT 1,
+                    last_seen_source_uid TEXT DEFAULT '',
+                    last_checked_at TEXT DEFAULT '',
+                    last_success_at TEXT DEFAULT '',
+                    last_error TEXT DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(platform, normalized_tag),
+                    FOREIGN KEY(tag_id) REFERENCES tags(id)
                 );
 
                 CREATE TABLE IF NOT EXISTS review_tasks (
@@ -158,6 +179,7 @@ class ImageIndexDB:
                 CREATE INDEX IF NOT EXISTS idx_image_tags_review_status ON image_tags(review_status);
                 CREATE INDEX IF NOT EXISTS idx_sources_platform ON sources(platform);
                 CREATE INDEX IF NOT EXISTS idx_crawl_jobs_status ON crawl_jobs(status);
+                CREATE INDEX IF NOT EXISTS idx_crawl_subscriptions_platform ON crawl_subscriptions(platform, enabled);
                 CREATE INDEX IF NOT EXISTS idx_review_tasks_status ON review_tasks(status);
                 CREATE INDEX IF NOT EXISTS idx_send_logs_session_id ON send_logs(session_id);
                 """
@@ -170,11 +192,25 @@ class ImageIndexDB:
             self._ensure_column(conn, 'image_tags', 'review_reason', "TEXT DEFAULT ''")
             self._ensure_column(conn, 'image_tags', 'updated_at', "TEXT DEFAULT ''")
             self._ensure_column(conn, 'crawl_jobs', 'attempt_count', 'INTEGER DEFAULT 0')
+            self._ensure_column(conn, 'crawl_jobs', 'include_tags_text', "TEXT DEFAULT ''")
+            self._ensure_column(conn, 'crawl_jobs', 'exclude_tags_text', "TEXT DEFAULT ''")
+            self._ensure_column(conn, 'crawl_jobs', 'tag_match_mode', "TEXT DEFAULT 'exact'")
+            self._ensure_column(conn, 'crawl_subscriptions', 'tag_id', 'INTEGER DEFAULT 0')
+            self._ensure_column(conn, 'crawl_subscriptions', 'query_text', "TEXT DEFAULT ''")
+            self._ensure_column(conn, 'crawl_subscriptions', 'enabled', 'INTEGER DEFAULT 1')
+            self._ensure_column(conn, 'crawl_subscriptions', 'last_seen_source_uid', "TEXT DEFAULT ''")
+            self._ensure_column(conn, 'crawl_subscriptions', 'last_checked_at', "TEXT DEFAULT ''")
+            self._ensure_column(conn, 'crawl_subscriptions', 'last_success_at', "TEXT DEFAULT ''")
+            self._ensure_column(conn, 'crawl_subscriptions', 'last_error', "TEXT DEFAULT ''")
             self._ensure_file_locations_initialized(conn)
 
     @staticmethod
     def _infer_storage_type(file_path: str) -> str:
         normalized = str(file_path or "").replace("\\", "/").lower()
+        if "/trash/" in normalized:
+            return "trash"
+        if "/images/restored/" in normalized:
+            return "restored"
         if "/images/imported/" in normalized:
             return "imported"
         return "library"
@@ -579,12 +615,14 @@ class ImageIndexDB:
             ).fetchone()['c']
             alias_count = conn.execute('SELECT COUNT(*) AS c FROM tag_aliases').fetchone()['c']
             job_count = conn.execute('SELECT COUNT(*) AS c FROM crawl_jobs').fetchone()['c']
+            subscription_count = conn.execute("SELECT COUNT(*) AS c FROM crawl_subscriptions WHERE enabled = 1").fetchone()['c']
             review_count = conn.execute("SELECT COUNT(*) AS c FROM review_tasks WHERE status IN ('pending', 'uncertain')").fetchone()['c']
         return {
             'images': int(images_count),
             'tags': int(tags_count),
             'aliases': int(alias_count),
             'crawl_jobs': int(job_count),
+            'crawl_subscriptions': int(subscription_count),
             'pending_reviews': int(review_count),
         }
 
@@ -701,15 +739,50 @@ class ImageIndexDB:
                 (image_id, platform, post_url, image_url, author, json.dumps(raw_tags or [], ensure_ascii=False), json.dumps(extra_json or {}, ensure_ascii=False), utcnow_str()),
             )
 
-    def create_crawl_job(self, platform: str, source_url: str, tags: list[str]) -> int:
+    def has_source_post_url(self, post_url: str, *, platform: str = '') -> bool:
+        raw_post_url = str(post_url or '').strip()
+        if not raw_post_url:
+            return False
+        sql = 'SELECT 1 FROM sources WHERE post_url = ?'
+        params: list[Any] = [raw_post_url]
+        if platform:
+            sql += ' AND platform = ?'
+            params.append(platform)
+        sql += ' LIMIT 1'
+        with self._lock, self._connect() as conn:
+            row = conn.execute(sql, params).fetchone()
+            return row is not None
+
+    def create_crawl_job(
+        self,
+        platform: str,
+        source_url: str,
+        tags: list[str],
+        *,
+        include_tags: list[str] | None = None,
+        exclude_tags: list[str] | None = None,
+        match_mode: str = 'exact',
+    ) -> int:
         now = utcnow_str()
         with self._lock, self._connect() as conn:
             cursor = conn.execute(
                 """
-                INSERT INTO crawl_jobs(platform, source_url, tags_text, status, progress, error_log, result_summary, attempt_count, created_at, updated_at)
-                VALUES(?, ?, ?, 'pending', 0, '', '', 0, ?, ?)
+                INSERT INTO crawl_jobs(
+                    platform, source_url, tags_text, include_tags_text, exclude_tags_text, tag_match_mode,
+                    status, progress, error_log, result_summary, attempt_count, created_at, updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, 'pending', 0, '', '', 0, ?, ?)
                 """,
-                (platform, source_url, ','.join(tags), now, now),
+                (
+                    platform,
+                    source_url,
+                    ','.join(tags),
+                    ','.join(include_tags or []),
+                    ','.join(exclude_tags or []),
+                    str(match_mode or 'exact'),
+                    now,
+                    now,
+                ),
             )
             return int(cursor.lastrowid)
 
@@ -895,6 +968,15 @@ class ImageIndexDB:
             image = conn.execute('SELECT * FROM images WHERE id = ?', (image_id,)).fetchone()
             if not image:
                 return None
+            file_locations = conn.execute(
+                """
+                SELECT file_path, file_name, storage_type, is_active, created_at, updated_at
+                FROM image_files
+                WHERE image_id = ?
+                ORDER BY updated_at DESC, id DESC
+                """,
+                (image_id,),
+            ).fetchall()
             tags = conn.execute(
                 """
                 SELECT t.name, t.is_character, it.source_type, it.review_status, it.review_reason, it.score
@@ -908,6 +990,17 @@ class ImageIndexDB:
             sources = conn.execute('SELECT platform, post_url, image_url, author, raw_tags, extra_json FROM sources WHERE image_id = ?', (image_id,)).fetchall()
             return {
                 'image': dict(image),
+                'file_locations': [
+                    {
+                        'file_path': str(row['file_path']),
+                        'file_name': str(row['file_name']),
+                        'storage_type': str(row['storage_type']),
+                        'is_active': bool(row['is_active']),
+                        'created_at': str(row['created_at']),
+                        'updated_at': str(row['updated_at']),
+                    }
+                    for row in file_locations
+                ],
                 'tags': [
                     {
                         'name': str(row['name']),
@@ -932,6 +1025,70 @@ class ImageIndexDB:
                 ],
             }
 
+    def trash_image(self, image_id: int, *, trash_path: str | None = None) -> tuple[bool, str]:
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            image = conn.execute('SELECT id FROM images WHERE id = ?', (image_id,)).fetchone()
+            if not image:
+                return False, f'图片不存在：{image_id}'
+
+            conn.execute(
+                'UPDATE image_files SET is_active = 0, updated_at = ? WHERE image_id = ? AND is_active = 1',
+                (now, image_id),
+            )
+
+            if trash_path:
+                trash_file_name = Path(trash_path).name
+                self._upsert_file_location(
+                    conn,
+                    image_id=image_id,
+                    file_path=trash_path,
+                    file_name=trash_file_name,
+                    storage_type='trash',
+                    now=now,
+                )
+                conn.execute(
+                    'UPDATE image_files SET is_active = 0, updated_at = ? WHERE image_id = ? AND file_path = ?',
+                    (now, image_id, trash_path),
+                )
+                conn.execute(
+                    'UPDATE images SET file_path = ?, file_name = ?, is_active = 0, updated_at = ? WHERE id = ?',
+                    (trash_path, trash_file_name, now, image_id),
+                )
+            else:
+                conn.execute(
+                    'UPDATE images SET is_active = 0, updated_at = ? WHERE id = ?',
+                    (now, image_id),
+                )
+        return True, f'已将图片 #{image_id} 移出可发送列表。'
+
+    def restore_image(self, image_id: int, *, restored_path: str, trash_path: str | None = None) -> tuple[bool, str]:
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            image = conn.execute('SELECT id FROM images WHERE id = ?', (image_id,)).fetchone()
+            if not image:
+                return False, f'图片不存在：{image_id}'
+
+            self._upsert_file_location(
+                conn,
+                image_id=image_id,
+                file_path=restored_path,
+                file_name=Path(restored_path).name,
+                storage_type=self._infer_storage_type(restored_path),
+                now=now,
+            )
+            conn.execute(
+                "UPDATE image_files SET is_active = 0, updated_at = ? WHERE image_id = ? AND storage_type = 'trash'",
+                (now, image_id),
+            )
+            if trash_path:
+                conn.execute(
+                    'UPDATE image_files SET is_active = 0, updated_at = ? WHERE image_id = ? AND file_path = ?',
+                    (now, image_id, trash_path),
+                )
+            self._sync_image_file_state(conn, image_id, preferred_path=restored_path, now=now)
+        return True, f'已恢复图片 #{image_id}。'
+
     def list_tags(self, *, keyword: str = '', limit: int = 100) -> list[sqlite3.Row]:
         sql = """
             SELECT t.id, t.name, t.is_character,
@@ -948,3 +1105,115 @@ class ImageIndexDB:
         params.append(limit)
         with self._lock, self._connect() as conn:
             return conn.execute(sql, params).fetchall()
+
+    def list_tags_for_auto_crawl(self, *, character_only: bool = True) -> list[sqlite3.Row]:
+        sql = 'SELECT id, name, is_character FROM tags'
+        if character_only:
+            sql += ' WHERE is_character = 1'
+        sql += ' ORDER BY name ASC'
+        with self._lock, self._connect() as conn:
+            return conn.execute(sql).fetchall()
+
+    def upsert_crawl_subscription(
+        self,
+        *,
+        platform: str,
+        tag_id: int,
+        tag_name: str,
+        query_text: str = '',
+        enabled: bool = True,
+    ) -> int:
+        normalized_tag = normalize_tag_name(tag_name)
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            existing = conn.execute(
+                'SELECT id FROM crawl_subscriptions WHERE platform = ? AND normalized_tag = ? LIMIT 1',
+                (platform, normalized_tag),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE crawl_subscriptions
+                    SET tag_id = ?, tag_name = ?, query_text = ?, enabled = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (tag_id, tag_name.strip(), query_text, 1 if enabled else 0, now, int(existing['id'])),
+                )
+                return int(existing['id'])
+            cursor = conn.execute(
+                """
+                INSERT INTO crawl_subscriptions(
+                    platform, tag_id, tag_name, normalized_tag, query_text, enabled,
+                    last_seen_source_uid, last_checked_at, last_success_at, last_error, created_at, updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, '', '', '', '', ?, ?)
+                """,
+                (platform, tag_id, tag_name.strip(), normalized_tag, query_text, 1 if enabled else 0, now, now),
+            )
+            return int(cursor.lastrowid)
+
+    def disable_missing_crawl_subscriptions(self, *, platform: str, keep_normalized_tags: set[str]) -> None:
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            if keep_normalized_tags:
+                placeholders = ','.join('?' for _ in keep_normalized_tags)
+                conn.execute(
+                    f"UPDATE crawl_subscriptions SET enabled = 0, updated_at = ? WHERE platform = ? AND normalized_tag NOT IN ({placeholders})",
+                    (now, platform, *sorted(keep_normalized_tags)),
+                )
+            else:
+                conn.execute(
+                    'UPDATE crawl_subscriptions SET enabled = 0, updated_at = ? WHERE platform = ?',
+                    (now, platform),
+                )
+
+    def list_crawl_subscriptions(self, *, platform: str = '', enabled_only: bool = False, limit: int = 200) -> list[sqlite3.Row]:
+        sql = 'SELECT * FROM crawl_subscriptions'
+        clauses: list[str] = []
+        params: list[Any] = []
+        if platform:
+            clauses.append('platform = ?')
+            params.append(platform)
+        if enabled_only:
+            clauses.append('enabled = 1')
+        if clauses:
+            sql += ' WHERE ' + ' AND '.join(clauses)
+        sql += ' ORDER BY platform ASC, tag_name ASC LIMIT ?'
+        params.append(limit)
+        with self._lock, self._connect() as conn:
+            return conn.execute(sql, params).fetchall()
+
+    def update_crawl_subscription_state(
+        self,
+        subscription_id: int,
+        *,
+        query_text: str | None = None,
+        enabled: bool | None = None,
+        last_seen_source_uid: str | None = None,
+        last_checked_at: str | None = None,
+        last_success_at: str | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        fields: list[str] = ['updated_at = ?']
+        params: list[Any] = [utcnow_str()]
+        if query_text is not None:
+            fields.append('query_text = ?')
+            params.append(query_text)
+        if enabled is not None:
+            fields.append('enabled = ?')
+            params.append(1 if enabled else 0)
+        if last_seen_source_uid is not None:
+            fields.append('last_seen_source_uid = ?')
+            params.append(last_seen_source_uid)
+        if last_checked_at is not None:
+            fields.append('last_checked_at = ?')
+            params.append(last_checked_at)
+        if last_success_at is not None:
+            fields.append('last_success_at = ?')
+            params.append(last_success_at)
+        if last_error is not None:
+            fields.append('last_error = ?')
+            params.append(last_error)
+        params.append(subscription_id)
+        with self._lock, self._connect() as conn:
+            conn.execute(f"UPDATE crawl_subscriptions SET {', '.join(fields)} WHERE id = ?", params)

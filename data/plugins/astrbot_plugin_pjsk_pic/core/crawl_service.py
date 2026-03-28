@@ -6,8 +6,10 @@ from typing import Iterable
 from astrbot.api import logger
 
 from .crawl_adapter import CrawlAdapterFactory
+from .crawl_tag_rules import CrawlTagRules
 from .db import ImageIndexDB
 from .importer import ImportedImageService
+from .matcher import normalize_tag_name
 from .review_service import ReviewService
 from .tag_cleaner import TagCleaner
 
@@ -42,11 +44,27 @@ class CrawlService:
                 pass
             self._worker_task = None
 
-    async def submit_job(self, platform: str, source_url: str, tags: list[str]) -> int:
+    async def submit_job(
+        self,
+        platform: str,
+        source_url: str,
+        tags: list[str],
+        *,
+        include_tags: list[str] | None = None,
+        exclude_tags: list[str] | None = None,
+        match_mode: str = "exact",
+    ) -> int:
         normalized_platform = CrawlAdapterFactory.normalize_platform(platform)
         if not CrawlAdapterFactory.supports(normalized_platform):
             raise ValueError(f"暂不支持的平台：{platform}")
-        job_id = self.db.create_crawl_job(normalized_platform, source_url, tags)
+        job_id = self.db.create_crawl_job(
+            normalized_platform,
+            source_url,
+            tags,
+            include_tags=include_tags,
+            exclude_tags=exclude_tags,
+            match_mode=match_mode,
+        )
         await self._enqueue_job(job_id)
         return job_id
 
@@ -90,7 +108,12 @@ class CrawlService:
         attempt_count = self.db.increment_crawl_job_attempt(job_id)
         platform = str(row["platform"])
         source_url = str(row["source_url"])
-        manual_tags = self._parse_tags_text(str(row["tags_text"] or ""))
+        job_rules = CrawlTagRules.from_db_row(row)
+        default_rules = CrawlTagRules.from_config(self.config)
+        manual_tags = job_rules.manual_tags
+        include_tags = self._normalized_rule_tags([*default_rules.include_tags, *job_rules.include_tags])
+        exclude_tags = self._normalized_rule_tags([*default_rules.exclude_tags, *job_rules.exclude_tags])
+        match_mode = str(row["tag_match_mode"] or "exact").strip().lower() or "exact"
         adapter = CrawlAdapterFactory.create(platform, config=self.config)
         max_candidates = max(1, int(self.config.get("crawler_max_candidates", 6) or 6))
         timeout_seconds = max(5, int(self.config.get("platform_request_timeout", self.config.get("crawler_timeout_seconds", 20)) or 20))
@@ -120,6 +143,8 @@ class CrawlService:
         approved_links = 0
         rejected_links = 0
         skipped_without_tags = 0
+        skipped_by_include = 0
+        skipped_by_exclude = 0
         similar_hits = 0
         failed_candidates = 0
         candidate_errors: list[str] = []
@@ -128,6 +153,28 @@ class CrawlService:
             progress = 10 + int(index / max(1, len(candidates)) * 80)
             self.db.update_crawl_job(job_id, progress=min(progress, 95))
             try:
+                translated_tags: list[str] = []
+                if isinstance(candidate.extra, dict):
+                    translated = candidate.extra.get("translated_tags")
+                    if isinstance(translated, list):
+                        translated_tags = [str(item) for item in translated]
+                candidate_tags = self.tag_cleaner.normalize_tags(
+                    [*candidate.raw_tags, *translated_tags],
+                    drop_noise=False,
+                )
+                filter_reason = self._match_filter_reason(
+                    candidate_tags,
+                    include_tags=include_tags,
+                    exclude_tags=exclude_tags,
+                    match_mode=match_mode,
+                )
+                if filter_reason == "exclude":
+                    skipped_by_exclude += 1
+                    continue
+                if filter_reason == "include":
+                    skipped_by_include += 1
+                    continue
+
                 imported = await self.importer.import_candidate(candidate)
                 imported_count += 1
                 if imported.similar_image_ids:
@@ -209,6 +256,10 @@ class CrawlService:
         )
         if skipped_without_tags:
             summary += f"，无 tag 图片 {skipped_without_tags}"
+        if skipped_by_include:
+            summary += f"，include 跳过 {skipped_by_include}"
+        if skipped_by_exclude:
+            summary += f"，exclude 跳过 {skipped_by_exclude}"
         if similar_hits:
             summary += f"，疑似重复 {similar_hits}"
         if failed_candidates:
@@ -220,13 +271,6 @@ class CrawlService:
             result_summary=summary,
             error_log="；".join(candidate_errors) if candidate_errors else "",
         )
-
-    @staticmethod
-    def _parse_tags_text(tags_text: str) -> list[str]:
-        if not tags_text:
-            return []
-        raw = tags_text.replace("，", ",").split(",")
-        return [item.strip() for item in raw if item.strip()]
 
     @staticmethod
     def _merge_tags(manual_tags: Iterable[str], raw_tags: Iterable[str]) -> list[str]:
@@ -241,3 +285,37 @@ class CrawlService:
                 seen.add(key)
                 result.append(tag)
         return result
+
+    def _normalized_rule_tags(self, tags: Iterable[str]) -> set[str]:
+        normalized = self.tag_cleaner.normalize_tags(list(tags), drop_noise=False)
+        return {normalize_tag_name(tag) for tag in normalized if tag}
+
+    @staticmethod
+    def _match_filter_reason(
+        candidate_tags: Iterable[str],
+        *,
+        include_tags: set[str],
+        exclude_tags: set[str],
+        match_mode: str = "exact",
+    ) -> str | None:
+        candidate_set = {normalize_tag_name(str(tag)) for tag in candidate_tags if str(tag).strip()}
+        candidate_set.discard("")
+        if exclude_tags and CrawlService._rule_set_matches(candidate_set, exclude_tags, match_mode=match_mode):
+            return "exclude"
+        if include_tags and not CrawlService._rule_set_matches(candidate_set, include_tags, match_mode=match_mode):
+            return "include"
+        return None
+
+    @staticmethod
+    def _rule_set_matches(candidate_set: set[str], rule_tags: set[str], *, match_mode: str = "exact") -> bool:
+        if not candidate_set or not rule_tags:
+            return False
+        if match_mode != "partial":
+            return bool(candidate_set.intersection(rule_tags))
+        for candidate in candidate_set:
+            for rule in rule_tags:
+                if not candidate or not rule:
+                    continue
+                if candidate == rule or candidate in rule or rule in candidate:
+                    return True
+        return False

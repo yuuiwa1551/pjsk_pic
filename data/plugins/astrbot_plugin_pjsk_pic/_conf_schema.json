@@ -1,162 +1,207 @@
 {
   "library_root": {
     "type": "string",
-    "description": "本地图库根目录。留空时默认使用插件数据目录下的 library 文件夹。",
+    "description": "??????????????????????? library ????",
     "default": ""
   },
   "scan_on_startup": {
     "type": "bool",
-    "description": "AstrBot 启动后是否自动扫描本地图库。",
+    "description": "AstrBot ??????????????",
     "default": true
   },
   "allow_fuzzy_match": {
     "type": "bool",
-    "description": "是否允许模糊匹配 tag 和别名。",
+    "description": "???? tag / alias ?????",
     "default": true
   },
   "recent_dedupe_count": {
     "type": "int",
-    "description": "每个会话最近去重的图片数量。",
+    "description": "??????????????",
     "default": 20
   },
   "enable_llm_tool": {
     "type": "bool",
-    "description": "是否开启 LLM 发图工具。",
+    "description": "???? LLM ?????",
     "default": true
   },
   "ambiguous_candidate_limit": {
     "type": "int",
-    "description": "模糊匹配存在多个候选时，最多展示几个候选 tag。",
+    "description": "????????????????????? tag?",
     "default": 5
   },
   "default_count": {
     "type": "int",
-    "description": "LLM 工具默认发图数量。当前建议为 1。",
+    "description": "LLM ?????????",
     "default": 1
   },
   "webui_enabled": {
     "type": "bool",
-    "description": "是否启用独立 WebUI 服务。",
+    "description": "?????? WebUI ???",
     "default": true
   },
   "webui_host": {
     "type": "string",
-    "description": "独立 WebUI 监听地址。可设为 0.0.0.0（局域网可访问）或 127.0.0.1（仅本机访问）。",
+    "description": "?? WebUI ?????",
     "default": "0.0.0.0"
   },
   "webui_port": {
     "type": "int",
-    "description": "独立 WebUI 监听端口。",
+    "description": "?? WebUI ?????",
     "default": 9099
   },
   "webui_access_token": {
     "type": "string",
-    "description": "独立 WebUI 可选访问令牌。配置后可通过 ?token=... 或请求头 X-PJSK-Token 访问。",
+    "description": "?? WebUI ???????",
     "default": ""
   },
   "submission_notify_enabled": {
     "type": "bool",
-    "description": "是否在收到新投稿后额外通知 AstrBot 管理员或指定白名单目标。",
+    "description": "????????????? AstrBot ?????????",
     "default": true
   },
   "submission_notify_use_astr_admins": {
     "type": "bool",
-    "description": "是否默认把 AstrBot 全局 admins_id 作为投稿通知接收人。",
+    "description": "?????? AstrBot ?? admins_id ??????????",
     "default": true
   },
   "submission_notify_targets": {
     "type": "string",
-    "description": "额外投稿通知目标。支持逗号/分号/换行分隔的用户 ID，或直接填写 unified_msg_origin。",
+    "description": "?????????????/??/?????",
     "default": ""
   },
   "submission_review_enabled": {
     "type": "bool",
-    "description": "是否启用投稿审核。关闭后新投稿会默认直接入库并可参与发图。",
-    "default": true
+    "description": "??????????????????????",
+    "default": false
   },
   "crawler_max_candidates": {
     "type": "int",
-    "description": "采集页面最多解析并下载几张图。",
+    "description": "???????????????????",
     "default": 6
   },
   "crawler_timeout_seconds": {
     "type": "int",
-    "description": "采集下载超时时间（秒）。",
+    "description": "????????????",
     "default": 20
   },
   "platform_request_timeout": {
     "type": "int",
-    "description": "平台采集请求超时时间（秒），优先于 crawler_timeout_seconds。",
+    "description": "??????????????? crawler_timeout_seconds?",
     "default": 20
   },
   "platform_retry_times": {
     "type": "int",
-    "description": "平台采集失败后的自动重试次数。",
+    "description": "???????????????",
     "default": 2
   },
   "max_tags_per_image": {
     "type": "int",
-    "description": "每张图最多写入多少个 tag。",
+    "description": "?????????? tag?",
     "default": 12
   },
   "tag_blacklist": {
     "type": "string",
-    "description": "额外 tag 黑名单，多个用英文逗号分隔。",
+    "description": "?? tag ????????????????",
     "default": ""
+  },
+  "crawl_include_tags": {
+    "type": "string",
+    "description": "?? include tag ???????????????????",
+    "default": ""
+  },
+  "crawl_exclude_tags": {
+    "type": "string",
+    "description": "?? exclude tag ?????????????????????? R-18 ? AI?",
+    "default": "R-18,AI"
   },
   "enable_phash_dedupe": {
     "type": "bool",
-    "description": "是否启用轻量感知哈希去重识别。",
+    "description": "???????????????",
     "default": true
   },
   "phash_max_distance": {
     "type": "int",
-    "description": "判定为疑似重复图的最大哈希距离。",
+    "description": "????????????????",
     "default": 8
   },
   "enable_auto_review": {
     "type": "bool",
-    "description": "是否启用多模态模型自动审核角色 tag。",
+    "description": "??????????????? tag?",
     "default": false
   },
   "review_provider_id": {
     "type": "string",
-    "description": "执行多模态审核使用的 provider id。留空则自动审核不会运行。",
+    "description": "?????????? provider id?",
     "default": ""
   },
   "review_confidence_threshold": {
     "type": "float",
-    "description": "自动审核通过/拒绝所需的最低置信度。",
+    "description": "?????? / ???????????",
     "default": 0.78
   },
   "approve_non_character_tags": {
     "type": "bool",
-    "description": "非角色 tag 是否默认直接通过。",
+    "description": "??? tag ?????????",
     "default": true
   },
   "guess_character_tags": {
     "type": "bool",
-    "description": "是否启用启发式角色 tag 判断。",
+    "description": "????????? tag ???",
     "default": true
   },
   "pixiv_refresh_token": {
     "type": "string",
-    "description": "Pixiv 登录增强预留字段，当前主要用于后续扩展。",
+    "description": "Pixiv App API ??? refresh token???? Pixiv ??????????????",
     "default": ""
+  },
+  "pixiv_auto_crawl_enabled": {
+    "type": "bool",
+    "description": "???? Pixiv ??? tag ?????",
+    "default": false
+  },
+  "pixiv_auto_crawl_character_only": {
+    "type": "bool",
+    "description": "????????? tag????? is_character=1 ? tag ??????",
+    "default": true
+  },
+  "pixiv_auto_crawl_interval_minutes": {
+    "type": "int",
+    "description": "Pixiv ?????????????",
+    "default": 60
+  },
+  "pixiv_auto_crawl_query_suffix": {
+    "type": "string",
+    "description": "Pixiv ?????????? tag ????????????? user?",
+    "default": "user"
+  },
+  "pixiv_auto_crawl_max_results_per_tag": {
+    "type": "int",
+    "description": "?? tag ????????? Pixiv ?????",
+    "default": 30
+  },
+  "pixiv_auto_crawl_max_pages_per_tag": {
+    "type": "int",
+    "description": "?? tag ????????? Pixiv ?????",
+    "default": 3
+  },
+  "pixiv_auto_crawl_max_new_jobs_per_cycle": {
+    "type": "int",
+    "description": "?????????????? Pixiv ?????",
+    "default": 30
   },
   "x_cookie_string": {
     "type": "string",
-    "description": "X/Twitter 请求使用的 Cookie 串，提升私有/受限页面可访问性。",
+    "description": "X / Twitter ????? Cookie ????",
     "default": ""
   },
   "x_account_pool_enabled": {
     "type": "bool",
-    "description": "X 账号池预留开关，当前版本仅预留配置位。",
+    "description": "X ???????????????????",
     "default": false
   },
   "xiaohongshu_cookie_string": {
     "type": "string",
-    "description": "小红书请求使用的 Cookie 串，提升页面解析成功率。",
+    "description": "???????? Cookie ????",
     "default": ""
   }
 }

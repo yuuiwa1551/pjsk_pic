@@ -7,6 +7,7 @@ from pathlib import Path
 from aiohttp import web
 from astrbot.api import logger
 
+from .crawl_tag_rules import parse_crawl_rule_text, parse_tag_csv
 from .db import ImageIndexDB
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -71,6 +72,10 @@ HTML_PAGE = """<!DOCTYPE html>
       <div class="row">
         <input id="jobTags" placeholder="可选 tags_csv，例如 初音未来,miku" style="flex:1;" />
         <button onclick="createJob()">新建任务</button>
+      </div>
+      <div class="row">
+        <input id="jobIncludeTags" placeholder="可选 include tags，例如 初音未来,天马司" style="flex:1;" />
+        <input id="jobExcludeTags" placeholder="可选 exclude tags，例如 R-18,梦向" style="flex:1;" />
       </div>
       <div class="list" id="jobs"></div>
     </section>
@@ -160,6 +165,8 @@ async function loadJobs() {
       <div><strong>#${item.id}</strong> [${item.status}] ${item.platform} · 第${item.attempt_count || 0}次</div>
       <div class="muted">${item.source_url}</div>
       <div>标签：${item.tags_text || '自动提取'}</div>
+      <div>包含采集：${item.include_tags_text || '-'}</div>
+      <div>排除采集：${item.exclude_tags_text || '-'}</div>
       <div>结果：${item.result_summary || item.error_log || '-'}</div>
       <div class="row"><button onclick="retryJob(${item.id})">重试</button></div>
     </div>
@@ -171,6 +178,8 @@ async function createJob() {
     platform: document.getElementById('jobPlatform').value,
     source_url: document.getElementById('jobUrl').value,
     tags: document.getElementById('jobTags').value,
+    include_tags: document.getElementById('jobIncludeTags').value,
+    exclude_tags: document.getElementById('jobExcludeTags').value,
   })});
   await loadJobs(); await loadSummary();
 }
@@ -240,7 +249,7 @@ class GalleryWebUI:
         self.db = db
         self.crawl_service = crawl_service
         self.host = "0.0.0.0"
-        self.port = 6199
+        self.port = 9099
         self.access_token = ""
         self._runner: web.AppRunner | None = None
         self._site: web.BaseSite | None = None
@@ -252,7 +261,7 @@ class GalleryWebUI:
 
     async def start(self, *, host: str, port: int, access_token: str = "") -> None:
         self.host = str(host or "0.0.0.0").strip() or "0.0.0.0"
-        self.port = max(1, int(port or 6199))
+        self.port = max(1, int(port or 9099))
         self.access_token = str(access_token or "").strip()
 
         if self.is_running:
@@ -467,11 +476,14 @@ class GalleryWebUI:
             return self._json_response({"items": [dict(row) for row in rows]})
 
         data = await self._json_body(request)
+        parsed_rules = parse_crawl_rule_text(str(data.get("tags", "")))
         try:
             job_id = await self.crawl_service.submit_job(
                 str(data.get("platform", "")).strip(),
                 str(data.get("source_url", "")).strip(),
-                self._parse_tags_text(str(data.get("tags", ""))),
+                parsed_rules.manual_tags,
+                include_tags=parse_tag_csv([*parsed_rules.include_tags, *parse_tag_csv(str(data.get("include_tags", "")))]),
+                exclude_tags=parse_tag_csv([*parsed_rules.exclude_tags, *parse_tag_csv(str(data.get("exclude_tags", "")))]),
             )
         except Exception as exc:
             return self._json_response({"ok": False, "message": str(exc)}, status=400)
@@ -530,10 +542,3 @@ class GalleryWebUI:
             bool(data.get("is_character", False)),
         )
         return self._json_response({"ok": ok, "message": message}, status=(200 if ok else 400))
-
-    @staticmethod
-    def _parse_tags_text(tags_text: str) -> list[str]:
-        if not tags_text:
-            return []
-        raw = tags_text.replace("，", ",").split(",")
-        return [item.strip() for item in raw if item.strip()]
