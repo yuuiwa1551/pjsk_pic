@@ -4065,28 +4065,60 @@ class ImageIndexDB:
 
     def commit_chat_collection_image(self, *, image_id: int, image_url: str, author: str,
                                      raw_tags: list[str], extra_json: dict[str, Any],
-                                     tag_ids: list[int], reason: str = '') -> dict[str, Any]:
+                                     tag_ids: list[int], reason: str = '',
+                                     tag_members: dict[int, list[int]] | None = None) -> dict[str, Any]:
         now = utcnow_str()
+        accepted = []
+        changed = []
         source_changed = False
-        tags_changed = []
         with self._lock, self._connect() as conn:
-            if not conn.execute('SELECT 1 FROM sources WHERE image_id = ? AND image_url = ?', (int(image_id), str(image_url))).fetchone():
-                conn.execute('INSERT INTO sources(image_id, platform, post_url, image_url, author, raw_tags, extra_json, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)',
-                             (int(image_id), 'chat', '', str(image_url), str(author or ''), json.dumps(raw_tags, ensure_ascii=False), json.dumps(extra_json, ensure_ascii=False), now))
-                source_changed = True
             for tag_id in tag_ids:
+                tag = conn.execute('SELECT status FROM tags WHERE id=?', (tag_id,)).fetchone()
                 rejected = conn.execute(
-                    "SELECT 1 FROM image_tags WHERE image_id = ? AND tag_id = ? "
-                    "AND review_status IN ('rejected', 'manual_rejected') LIMIT 1",
-                    (int(image_id), int(tag_id)),
+                    "SELECT 1 FROM image_tags WHERE image_id=? AND tag_id=? "
+                    "AND review_status IN ('rejected','manual_rejected') LIMIT 1",
+                    (image_id, tag_id),
                 ).fetchone()
-                if rejected:
+                if tag and tag['status'] == 'active' and not rejected:
+                    accepted.append(tag_id)
+            accepted = [tag_id for tag_id in accepted
+                        if set((tag_members or {}).get(tag_id, [])).issubset(accepted)]
+            has_character = any(conn.execute(
+                "SELECT 1 FROM tags WHERE id=? AND tag_type='character'", (tag_id,)
+            ).fetchone() for tag_id in accepted)
+            if not has_character:
+                accepted = []
+            for tag_id in accepted:
+                existing = conn.execute(
+                    "SELECT 1 FROM image_tags WHERE image_id=? AND tag_id=? "
+                    "AND review_status IN ('approved','manual_approved') LIMIT 1",
+                    (image_id, tag_id),
+                ).fetchone()
+                if existing:
                     continue
-                cursor = conn.execute('INSERT OR IGNORE INTO image_tags(image_id, tag_id, source_type, score, review_status, review_reason, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)',
-                                      (int(image_id), int(tag_id), 'chat_auto_collection', 1.0, 'approved', str(reason or '主聊天自动收图'), now, now))
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO image_tags(image_id,tag_id,source_type,score,review_status,"
+                    "review_reason,created_at,updated_at) VALUES(?,?,'chat_auto_collection',1,'approved',?,?,?)",
+                    (image_id, tag_id, reason or '主聊天自动收图', now, now),
+                )
                 if cursor.rowcount:
-                    tags_changed.append(int(tag_id))
-        return {'changed': bool(source_changed or tags_changed), 'source_changed': source_changed, 'tag_ids_changed': tags_changed}
+                    changed.append(tag_id)
+            if accepted and not conn.execute(
+                'SELECT 1 FROM sources WHERE image_id=? AND image_url=?', (image_id, image_url)
+            ).fetchone():
+                names = [conn.execute('SELECT name FROM tags WHERE id=?', (x,)).fetchone()['name'] for x in accepted]
+                metadata = {**extra_json, 'collection_reason': reason, 'selected_tag_ids': accepted}
+                conn.execute(
+                    'INSERT INTO sources(image_id,platform,post_url,image_url,author,raw_tags,extra_json,created_at) '
+                    "VALUES(?,'chat',?,?,?,?,?,?)",
+                    (image_id, 'chat://' + str(extra_json.get('source_message_id', '')),
+                     image_url, author, json.dumps(names, ensure_ascii=False),
+                     json.dumps(metadata, ensure_ascii=False), now),
+                )
+                source_changed = True
+        return {'changed': bool(accepted and (source_changed or changed)),
+                'source_changed': source_changed, 'tag_ids_changed': changed,
+                'tag_ids_accepted': accepted, 'tag_ids_skipped': [x for x in tag_ids if x not in accepted]}
 
     @staticmethod
     def normalize_source_post_url(platform: str, post_url: str) -> str:

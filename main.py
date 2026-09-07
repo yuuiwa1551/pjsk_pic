@@ -20,6 +20,7 @@ from astrbot.core.agent.tool import FunctionTool, ToolSet
 from astrbot.core.agent.message import TextPart
 from astrbot.api.message_components import Plain
 from astrbot.core.message.message_event_result import ResultContentType
+from .core.chat_image_context import ChatImageContext
 
 from .core import (
     AutoCrawlService,
@@ -49,7 +50,6 @@ from .core import (
     tag_type_label,
 )
 from .core.command_compat import expose_group_subcommands_at_root
-from .core.message_images import prepare_chat_images
 from .core.webui import GalleryWebUI
 
 
@@ -133,6 +133,7 @@ class PJSKPicPlugin(Star):
         self.chat_image_collection_service = ChatImageCollectionService(
             self.db, self.importer, self.data_dir,
         )
+        self.chat_image_context = ChatImageContext()
         self.tag_governance_service = TagGovernanceService(self.db)
         self.submission_notify_service = SubmissionNotifyService(context, self.db, config)
         self.qq_review_service = QQReviewSessionService(self.db, config)
@@ -180,11 +181,16 @@ class PJSKPicPlugin(Star):
         result = await self.chat_image_collection_service.save(state, image_ref, tag_ids, reason)
         return json.dumps(result, ensure_ascii=False)
 
+    @event_filter.event_message_type(event_filter.EventMessageType.ALL, priority=sys.maxsize)
+    async def capture_gallery_images(self, event: AstrMessageEvent):
+        if self._chat_collection_allowed(event) and str(event.get_sender_id()) != str(event.get_self_id()):
+            self.chat_image_context.capture(event)
+
     @event_filter.on_llm_request(priority=-10)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
         if not self._chat_collection_allowed(event):
             return
-        images = await prepare_chat_images(
+        images = await self.chat_image_context.prepare(
             event, req,
             attach_originals=bool(self.config.get("chat_image_collection_attach_originals", True)),
         )
@@ -241,6 +247,8 @@ class PJSKPicPlugin(Star):
                 result.chain.append(Plain("\n" + summary))
 
     async def initialize(self) -> None:
+        if self.config.get('chat_image_collection_enabled', False):
+            await self.chat_image_collection_service.prepare([])
         library_root = self._library_root()
         library_root.mkdir(parents=True, exist_ok=True)
         if self.config.get("scan_on_startup", True):

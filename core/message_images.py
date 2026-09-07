@@ -71,36 +71,6 @@ def direct_message_images(event) -> list[MessageImage]:
     return result
 
 
-async def prepare_chat_images(event, req, *, attach_originals: bool = True) -> list[MessageImage]:
-    """Build exact references from the current provider request image inputs."""
-    refs: list[str] = []
-    for value in list(getattr(req, "image_urls", []) or []):
-        text = str(value or "").strip()
-        if text and text not in refs:
-            refs.append(text)
-    for message in list(getattr(req, "contexts", []) or []):
-        content = message.get("content") if isinstance(message, dict) else None
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if not isinstance(part, dict) or part.get("type") != "image_url":
-                continue
-            image_url = part.get("image_url")
-            if isinstance(image_url, dict):
-                image_url = image_url.get("url")
-            text = str(image_url or "").strip()
-            if text and text not in refs:
-                refs.append(text)
-    metadata = message_metadata(event)
-    return [
-        MessageImage(
-            Image(url=value) if value.startswith(("http://", "https://", "data:")) else Image(file=value),
-            {**metadata, "image_index": index},
-        )
-        for index, value in enumerate(refs, 1)
-    ]
-
-
 async def collect_submission_images(event) -> ImageCollection:
     result = ImageCollection()
     visited: set[str] = set()
