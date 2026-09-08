@@ -31,6 +31,7 @@ class ChatImageCollection:
     images: dict[str, MessageImage] = field(default_factory=dict)
     candidates: list[dict[str, Any]] = field(default_factory=list)
     saved: dict[str, dict[str, Any]] = field(default_factory=dict)
+    agent_done: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 class ChatImageCollectionService:

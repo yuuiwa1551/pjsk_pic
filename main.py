@@ -226,11 +226,18 @@ class PJSKPicPlugin(Star):
             "候选 tag：" + json.dumps(state.candidates, ensure_ascii=False)
         )
 
+    @event_filter.on_llm_response(priority=-10000)
+    async def mark_chat_collection_done(self, event: AstrMessageEvent, response):
+        # AstrBot emits this hook from MainAgentHooks.on_agent_done, after all tools.
+        state = event.get_extra("pjsk_chat_collection")
+        if state is not None:
+            state.agent_done = True
+
     @event_filter.on_decorating_result(priority=-10000)
     async def decorate_chat_collection(self, event: AstrMessageEvent):
         state = event.get_extra("pjsk_chat_collection")
         result = event.get_result()
-        if state is None or result is None:
+        if state is None or result is None or not state.agent_done:
             return
         streaming = result.result_content_type == ResultContentType.STREAMING_FINISH
         if not streaming and (

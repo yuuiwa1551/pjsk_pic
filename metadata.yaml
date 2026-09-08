@@ -1,7 +1,7 @@
 name: astrbot_plugin_pjsk_pic
 display_name: PJSK 图片库
 desc: 支持本地图库发图、多平台采集、Pixiv / 小红书按 tag 增量抓图、自动审核与 WebUI 管理的 PJSK 图片库插件
-version: 0.23.1
+version: 0.23.2
 author: yuuiwa1551
 repo: https://github.com/yuuiwa1551/astrbot_plugin_pjsk_pic
 license: AGPL-3.0-or-later
