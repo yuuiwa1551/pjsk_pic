@@ -46,7 +46,7 @@ class ChatImageContext:
             item = locations.get(location)
             if item is None:
                 # Old multimodal history may survive a restart; keep its unknown origin explicit.
-                item = MessageImage(Image(url=location) if location.startswith(('http', 'data:')) else Image(file=location),
+                item = MessageImage(Image(file=location),
                     {'session_id': event.unified_msg_origin, 'source_message_id': '',
                      'source_sender_id': '', 'source_sender_name': '', 'source_origin': 'historical_unknown'})
             chosen[item.ref] = item

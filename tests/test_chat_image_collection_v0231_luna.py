@@ -18,9 +18,9 @@ PACKAGE = "pjsk_luna_test_core"
 
 
 class FakeImage:
-    def __init__(self, *, url: str = "", file: str = "") -> None:
+    def __init__(self, file: str | None, *, url: str = "", **_) -> None:
         self.url = url
-        self.file = file
+        self.file = file or ""
 
     async def convert_to_file_path(self) -> str:
         return self.file or self.url
@@ -159,6 +159,54 @@ class ChatImageContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(isinstance(x, ImageURLPart) and x.image_url.id == item.ref for x in req.extra_user_content_parts))
         self.assertEqual("u99", item.metadata["source_sender_id"])
         self.assertEqual("历史发送者", item.metadata["source_sender_name"])
+
+    async def test_unknown_historical_http_and_data_images_are_preserved(self):
+        locations = [
+            "https://cdn.invalid/history.png",
+            "data:image/png;base64," + base64.b64encode(b"history-image").decode(),
+        ]
+        for location in locations:
+            with self.subTest(location=location[:32]):
+                event = Event([])
+                ctx = chat_context.ChatImageContext()
+                req = Request(contexts=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "历史图片"},
+                        {"type": "image_url", "image_url": {"url": location}},
+                    ],
+                }])
+
+                found = await ctx.prepare(event, req, attach_originals=True)
+
+                self.assertEqual(1, len(found))
+                self.assertEqual(location, found[0].location)
+                self.assertEqual("historical_unknown", found[0].metadata["source_origin"])
+                image_parts = [
+                    part for part in req.contexts[0]["content"]
+                    if part.get("type") == "image_url"
+                ]
+                self.assertEqual([location], [part["image_url"]["url"] for part in image_parts])
+
+    async def test_unknown_history_and_captured_marker_share_one_request(self):
+        event = Event([{"type": "image", "data": {"file": "/original/one.png"}}])
+        ctx = chat_context.ChatImageContext()
+        ctx.capture(event)
+        captured = event.get_extra("pjsk_gallery_image_sources")[0]
+        unknown_location = "data:image/png;base64," + base64.b64encode(b"history-image").decode()
+        req = Request(
+            image_urls=[unknown_location],
+            prompt=f"历史记录 [gallery_image:{captured.ref}]",
+        )
+
+        found = await ctx.prepare(event, req, attach_originals=True)
+
+        self.assertEqual({captured.ref, next(item.ref for item in found if item.location == unknown_location)},
+                         {item.ref for item in found})
+        self.assertTrue(any(
+            isinstance(part, ImageURLPart) and part.image_url.id == captured.ref
+            for part in req.extra_user_content_parts
+        ))
 
     async def test_forward_nodes_keep_original_sender_and_position(self):
         class Bot:
