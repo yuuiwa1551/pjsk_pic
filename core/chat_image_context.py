@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import copy
 import re
-import mimetypes
 from collections import OrderedDict
 
+from astrbot.api import logger
 from astrbot.api.message_components import Image
 from astrbot.core.agent.message import ImageURLPart, TextPart
+from astrbot.core.utils.media_utils import MediaResolver
 
 from .message_images import MessageImage, direct_message_images
 
@@ -41,6 +42,31 @@ class ChatImageContext:
                 locations[item.metadata['resolved_path']] = item
         chosen = {}
         visible_locations = set()
+        prepared_locations = {}
+        prepared_paths = {}
+
+        async def prepare_original(location, item=None):
+            if location.startswith('data:'):
+                return location
+            if location in prepared_locations:
+                return prepared_locations[location]
+            item = item or locations.get(location)
+            source = (item.metadata.get('resolved_path') or location) if item else location
+            try:
+                path = await MediaResolver(source, media_type='image').to_path()
+                data = await MediaResolver(path, media_type='image').to_base64_data()
+                result = data.to_data_url()
+            except Exception as exc:
+                # An unavailable optional history image must not break normal chat.
+                logger.warning('[PJSKPic] 跳过不可用历史补图 ref=%s error=%s',
+                               item.ref if item else 'historical_unknown', type(exc).__name__)
+                result = None
+            else:
+                prepared_paths[location] = path
+                if item is not None:
+                    item.metadata['resolved_path'] = path
+            prepared_locations[location] = result
+            return result
 
         def include(location):
             item = locations.get(location)
@@ -49,6 +75,8 @@ class ChatImageContext:
                 item = MessageImage(Image(file=location),
                     {'session_id': event.unified_msg_origin, 'source_message_id': '',
                      'source_sender_id': '', 'source_sender_name': '', 'source_origin': 'historical_unknown'})
+            if location in prepared_paths:
+                item.metadata['resolved_path'] = prepared_paths[location]
             chosen[item.ref] = item
             visible_locations.add(location)
             visible_locations.add(item.location)
@@ -74,7 +102,12 @@ class ChatImageContext:
                 elif part.get('type') == 'image_url':
                     value = part['image_url']
                     location = value['url'] if isinstance(value, dict) else value
+                    original = await prepare_original(location)
+                    if original is None:
+                        annotated.append({'type': 'text', 'text': '[历史图片已不可用]'})
+                        continue
                     ref = include(location)
+                    part['image_url'] = {**value, 'url': original} if isinstance(value, dict) else {'url': original}
                     annotated.append({'type': 'text', 'text': f'下面这张图片的 image_ref={ref}'})
                 annotated.append(part)
             message['content'] = annotated
@@ -94,11 +127,9 @@ class ChatImageContext:
             for ref, item in known.items():
                 if ref not in refs or item.location in visible_locations:
                     continue
-                # Add the known original beside its identifier in the same model request.
-                location = item.location
-                if not location.startswith(('http://', 'https://', 'data:')):
-                    mime = mimetypes.guess_type(location)[0] or 'image/png'
-                    location = f'data:{mime};base64,' + await item.image.convert_to_base64()
+                location = await prepare_original(item.location, item)
+                if location is None:
+                    continue
                 req.extra_user_content_parts.extend([
                     TextPart(text=f'上下文图片原图，image_ref={ref}'),
                     ImageURLPart(image_url=ImageURLPart.ImageURL(url=location, id=ref)),

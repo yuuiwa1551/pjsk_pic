@@ -15,6 +15,10 @@ from pathlib import Path
 
 CORE_DIR = Path(__file__).resolve().parents[1] / "core"
 PACKAGE = "pjsk_luna_test_core"
+MEDIA_RESOLVER_PATHS: dict[str, str] = {}
+MEDIA_RESOLVER_PAYLOADS: dict[str, bytes] = {}
+MEDIA_RESOLVER_FAILURES: set[str] = set()
+MEDIA_RESOLVER_CALLS: list[tuple[str, str, str]] = []
 
 
 class FakeImage:
@@ -27,6 +31,47 @@ class FakeImage:
 
     async def convert_to_base64(self) -> str:
         return base64.b64encode(b"local-image").decode()
+
+
+class FakeResolvedMediaData:
+    def __init__(self, base64_data: str, mime_type: str) -> None:
+        self.base64_data = base64_data
+        self.mime_type = mime_type
+
+    def to_data_url(self) -> str:
+        return f"data:{self.mime_type};base64,{self.base64_data}"
+
+
+class FakeMediaResolver:
+    def __init__(self, media_ref: str, *, media_type: str = "file", **_) -> None:
+        self.media_ref = str(media_ref)
+        self.media_type = media_type
+
+    def _record(self, operation: str) -> None:
+        MEDIA_RESOLVER_CALLS.append((operation, self.media_ref, self.media_type))
+
+    def _path(self) -> str:
+        if self.media_ref in MEDIA_RESOLVER_FAILURES:
+            raise OSError(f"unavailable media: {self.media_ref}")
+        if self.media_ref in MEDIA_RESOLVER_PATHS:
+            return MEDIA_RESOLVER_PATHS[self.media_ref]
+        if self.media_ref.startswith(("http://", "https://", "data:")):
+            raise OSError(f"unmapped remote media: {self.media_ref}")
+        return self.media_ref
+
+    async def to_path(self, **_) -> str:
+        self._record("to_path")
+        return self._path()
+
+    async def to_base64_data(self, **_) -> FakeResolvedMediaData:
+        self._record("to_base64_data")
+        path = self._path()
+        payload = MEDIA_RESOLVER_PAYLOADS.get(path, b"resolved-image")
+        return FakeResolvedMediaData(base64.b64encode(payload).decode(), "image/png")
+
+    async def to_data_url(self, **_) -> str:
+        data = await self.to_base64_data()
+        return data.to_data_url()
 
 
 class TextPart:
@@ -52,6 +97,10 @@ def install_stubs() -> None:
     agent = types.ModuleType("astrbot.core.agent.message")
     agent.ImageURLPart = ImageURLPart
     agent.TextPart = TextPart
+    utils = types.ModuleType("astrbot.core.utils")
+    utils.__path__ = []
+    media_utils = types.ModuleType("astrbot.core.utils.media_utils")
+    media_utils.MediaResolver = FakeMediaResolver
     astrbot = types.ModuleType("astrbot")
     astrbot.__path__ = []
     core = types.ModuleType("astrbot.core")
@@ -63,8 +112,12 @@ def install_stubs() -> None:
         "astrbot.core": core,
         "astrbot.core.agent": types.ModuleType("astrbot.core.agent"),
         "astrbot.core.agent.message": agent,
+        "astrbot.core.utils": utils,
+        "astrbot.core.utils.media_utils": media_utils,
     })
     astrbot.api = api
+    core.utils = utils
+    utils.media_utils = media_utils
 
 
 install_stubs()
@@ -133,6 +186,12 @@ class FakeImporter:
 
 
 class ChatImageContextTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        MEDIA_RESOLVER_PATHS.clear()
+        MEDIA_RESOLVER_PAYLOADS.clear()
+        MEDIA_RESOLVER_FAILURES.clear()
+        MEDIA_RESOLVER_CALLS.clear()
+
     async def test_multi_image_refs_preserve_order_and_resolve_local_paths(self):
         event = Event([
             {"type": "image", "data": {"file": "/original/one.png"}},
@@ -165,6 +224,8 @@ class ChatImageContextTests(unittest.IsolatedAsyncioTestCase):
             "https://cdn.invalid/history.png",
             "data:image/png;base64," + base64.b64encode(b"history-image").decode(),
         ]
+        MEDIA_RESOLVER_PATHS[locations[0]] = "/resolved/history.png"
+        MEDIA_RESOLVER_PAYLOADS["/resolved/history.png"] = b"history-image"
         for location in locations:
             with self.subTest(location=location[:32]):
                 event = Event([])
@@ -186,7 +247,93 @@ class ChatImageContextTests(unittest.IsolatedAsyncioTestCase):
                     part for part in req.contexts[0]["content"]
                     if part.get("type") == "image_url"
                 ]
-                self.assertEqual([location], [part["image_url"]["url"] for part in image_parts])
+                expected_url = "data:image/png;base64," + base64.b64encode(b"history-image").decode()
+                self.assertEqual([expected_url], [part["image_url"]["url"] for part in image_parts])
+
+    async def test_resolved_path_is_preferred_for_history_original_data_url(self):
+        event = Event([{"type": "image", "data": {"file": "/original/one.png"}}])
+        ctx = chat_context.ChatImageContext()
+        ctx.capture(event)
+        item = event.get_extra("pjsk_gallery_image_sources")[0]
+        item.metadata["resolved_path"] = "/resolved/one.png"
+        MEDIA_RESOLVER_PAYLOADS["/resolved/one.png"] = b"resolved-image"
+        req = Request(prompt=f"上下文 [gallery_image:{item.ref}]")
+
+        found = await ctx.prepare(event, req, attach_originals=True)
+
+        expected_url = "data:image/png;base64," + base64.b64encode(b"resolved-image").decode()
+        self.assertEqual([item.ref], [x.ref for x in found])
+        self.assertTrue(any(
+            isinstance(part, ImageURLPart)
+            and part.image_url.id == item.ref
+            and part.image_url.url == expected_url
+            for part in req.extra_user_content_parts
+        ))
+        self.assertIn(("to_path", "/resolved/one.png", "image"), MEDIA_RESOLVER_CALLS)
+        self.assertIn(("to_base64_data", "/resolved/one.png", "image"), MEDIA_RESOLVER_CALLS)
+        self.assertNotIn(("to_path", "/original/one.png", "image"), MEDIA_RESOLVER_CALLS)
+
+    async def test_failed_remote_history_is_skipped_without_mutating_current_image_urls(self):
+        bad = "https://bad.invalid/history.png"
+        good = "https://cdn.invalid/history-good.png"
+        current = "/current/image.png"
+        MEDIA_RESOLVER_FAILURES.add(bad)
+        MEDIA_RESOLVER_PATHS[good] = "/resolved/history-good.png"
+        MEDIA_RESOLVER_PAYLOADS["/resolved/history-good.png"] = b"history-good"
+        event = Event([])
+        ctx = chat_context.ChatImageContext()
+        req = Request(
+            image_urls=[current],
+            contexts=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "历史图片"},
+                    {"type": "image_url", "image_url": {"url": bad}},
+                    {"type": "image_url", "image_url": {"url": good}},
+                ],
+            }],
+        )
+
+        found = await ctx.prepare(event, req, attach_originals=True)
+
+        self.assertEqual([current], req.image_urls)
+        self.assertEqual({current, good}, {item.location for item in found})
+        self.assertNotIn(bad, {item.location for item in found})
+        self.assertNotIn(bad, req.prompt)
+        context_images = [
+            part["image_url"]["url"]
+            for part in req.contexts[0]["content"]
+            if part.get("type") == "image_url"
+        ]
+        self.assertNotIn(bad, context_images)
+        self.assertIn("data:image/png;base64," + base64.b64encode(b"history-good").decode(), context_images)
+
+    async def test_import_into_prefers_resolved_path_for_remote_image(self):
+        class Importer:
+            def __init__(self):
+                self.local_paths = []
+                self.remote_urls = []
+
+            async def import_local_file(self, path: Path, *, platform: str):
+                self.local_paths.append((path, platform))
+                return "local"
+
+            async def import_candidate(self, candidate):
+                self.remote_urls.append(candidate.image_url)
+                return "remote"
+
+        remote = "https://cdn.invalid/original.png"
+        item = message_images.MessageImage(
+            FakeImage(None, url=remote),
+            {"resolved_path": "/resolved/original.png"},
+        )
+        importer = Importer()
+
+        result = await item.import_into(importer)
+
+        self.assertEqual("local", result)
+        self.assertEqual([(Path("/resolved/original.png"), "submission")], importer.local_paths)
+        self.assertEqual([], importer.remote_urls)
 
     async def test_unknown_history_and_captured_marker_share_one_request(self):
         event = Event([{"type": "image", "data": {"file": "/original/one.png"}}])

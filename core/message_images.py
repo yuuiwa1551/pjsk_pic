@@ -24,6 +24,8 @@ class MessageImage:
         return 'g' + hashlib.sha256(value.encode()).hexdigest()[:16]
 
     async def import_into(self, importer):
+        if self.metadata.get('resolved_path'):
+            return await importer.import_local_file(Path(self.metadata['resolved_path']), platform='submission')
         if self.location.startswith(('https://', 'http://')):
             return await importer.import_candidate(CrawlCandidate(
                 platform='submission', post_url='', image_url=self.location,
